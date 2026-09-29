@@ -255,39 +255,9 @@ struct server_slot {
 
     server_prompt prompt;
 
-    bool prompt_save(server_prompt_cache & prompt_cache) const {
-        if (prompt.tokens.size() == 0) {
-            return false;
-        }
-
-        const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
-
-        const size_t cur_size = cur_size_tgt + cur_size_dft;
-
-        SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
-                (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
-
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
-            return false;
-        }
-
-        llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        if (ctx_dft) {
-            llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
-        }
-
-        return true;
-    }
-
-    bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
-        if (!res) {
-            SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
-        }
-
-        return res;
+    bool prompt_save(server_prompt_cache & cache, const server_prompt_cache_state * keep = nullptr) const {
+        const auto result = cache.save(prompt, ctx_tgt, ctx_dft, id, lora, spec, keep);
+        return result == SERVER_PROMPT_SAVED || result == SERVER_PROMPT_ALREADY_SAVED;
     }
 
     void prompt_clear() {
@@ -1528,14 +1498,12 @@ private:
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
-        bool update_cache = false;
-
-        // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
             if (ret) {
                 SLT_INF(*ret, "selected slot by id (%d)\n", task.id_slot);
             }
+            return ret;
         }
 
         // find the slot that has at least n% prompt similarity
@@ -1582,11 +1550,6 @@ private:
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
-
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
-                }
             }
         }
 
@@ -1609,31 +1572,6 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
-
-                update_cache = true;
-            }
-        }
-
-        if (ret) {
-            update_cache = update_cache && prompt_cache;
-
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-            if (update_cache) {
-                SRV_TRC("%s", "updating prompt cache\n");
-
-                const int64_t t_start = ggml_time_us();
-
-                ret->prompt_save(*prompt_cache);
-
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
-                    ret->prompt_clear();
-                }
-
-                prompt_cache->update();
-
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
         }
 
@@ -1660,6 +1598,12 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                if (prompt_cache && slot.prompt.cache_eligible && !slot.prompt_save(*prompt_cache)) {
+                    SRV_WRN("slot %d cache lost during required KV pressure purge\n", slot.id);
+                }
+                if (prompt_cache) {
+                    prompt_cache->update();
+                }
                 slot.prompt_clear();
 
                 res = true;
@@ -1686,27 +1630,17 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
-        // process per-request lora adapters
-        if (!task.params.lora.empty()) {
-            auto task_loras = construct_lora_list(task.params.lora);
-            if (!are_lora_equal(task_loras, slot.lora)) {
-                // if lora has changed, check to see if the cache should be cleared
-                if (lora_should_clear_cache(slot.lora, task_loras)) {
-                    SLT_TRC(slot, "clearing cache for lora change. %zu loras -> %zu loras\n", slot.lora.size(), task.params.lora.size());
-                    slot.prompt.clear();
-                } else {
-                    SLT_TRC(slot, "keeping cache for alora. %zu target loras\n", task_loras.size());
-                }
-                slot.lora = task_loras;
-            }
-        } else {
-            slot.lora = params_base.lora_adapters;
+        GGML_ASSERT(!slot.is_processing());
+        if (!task.tokens.validate(ctx_tgt)) {
+            send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
+            return false;
         }
+        auto task_loras = task.params.lora.empty() ? params_base.lora_adapters : construct_lora_list(task.params.lora);
 
         // if using alora, make sure it's only a single one requested and active
         size_t alora_invocation_start = task.tokens.size();
-        if (lora_all_alora(slot.lora)) {
-            const auto & enabled_ids = lora_get_enabled_ids(slot.lora);
+        if (lora_all_alora(task_loras)) {
+            const auto & enabled_ids = lora_get_enabled_ids(task_loras);
             // TODO: This will error out if a user requests two aloras, but only
             // provides the activation string for one. We could, instead search
             // for all requested alora activation strings and then either keep
@@ -1715,7 +1649,7 @@ private:
                 send_error(task, "Cannot run multiple aLoRAs in a single request", ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
-            const auto & lora = slot.lora[enabled_ids[0]].ptr;
+            const auto & lora = task_loras[enabled_ids[0]].ptr;
 
             // get the pointer and count for the invocation tokens
             const uint64_t      n_invocation_tokens = llama_adapter_get_alora_n_invocation_tokens(lora);
@@ -1744,16 +1678,10 @@ private:
             // if the activation string is not found, disable the alora
             if (alora_invocation_start == task.tokens.size()) {
                 SLT_DBG(slot, "alora %zu requested, but not found. deactivating\n", enabled_ids[0]);
-                slot.lora[enabled_ids[0]].scale = 0.0f;
+                task_loras[enabled_ids[0]].scale = 0.0f;
             } else {
                 SLT_DBG(slot, "alora %zu activated starting at %zu\n", enabled_ids[0], alora_invocation_start);
-                slot.alora_invocation_start = alora_invocation_start;
             }
-        }
-
-        if (!task.tokens.validate(ctx_tgt)) {
-            send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
-            return false;
         }
 
         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
@@ -1793,6 +1721,44 @@ private:
             }
         } else {
             slot.smpl.reset();
+        }
+
+        const bool same_lora = are_lora_equal(slot.lora, task_loras);
+        const bool clear_lora = !same_lora && lora_should_clear_cache(slot.lora, task_loras);
+        const bool can_reuse = task.params.cache_prompt && !task.is_child() &&
+            (task.type == SERVER_TASK_TYPE_COMPLETION || task.type == SERVER_TASK_TYPE_INFILL);
+        const server_prompt_cache_state * candidate = nullptr;
+        const size_t reuse_limit = lora_all_alora(task_loras) && alora_invocation_start > 0
+            ? alora_invocation_start - 1 : task.tokens.size();
+        if (prompt_cache && can_reuse && task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const server_prompt empty;
+            candidate = prompt_cache->find_best(!clear_lora && slot.prompt.cache_reusable ? slot.prompt : empty,
+                    task.tokens, llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id),
+                    n_swa, task_loras, reuse_limit);
+        }
+        const size_t lcp = slot.prompt.tokens.get_common_prefix(task.tokens);
+        const bool replace = !same_lora || !can_reuse || candidate || lcp < slot.prompt.tokens.size();
+        if (prompt_cache && replace && slot.prompt.cache_eligible && !slot.prompt.tokens.empty()) {
+            if (!slot.prompt_save(*prompt_cache, candidate)) {
+                SLT_WRN(slot, "%s", "outgoing branch could not be preserved in RAM\n");
+            }
+        }
+        if (clear_lora || !slot.prompt.cache_reusable || !can_reuse) {
+            slot.prompt_clear();
+        }
+        slot.lora = std::move(task_loras);
+        slot.alora_invocation_start = lora_all_alora(slot.lora) ? (int32_t) alora_invocation_start : -1;
+        if (candidate && !prompt_cache->load(slot.prompt, *candidate, ctx_tgt, ctx_dft, slot.id, spec.get())) {
+            slot.prompt_clear();
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            slot.smpl.reset();
+            send_error(task, "Failed to restore prompt cache state", ERROR_TYPE_SERVER);
+            return false;
+        }
+        slot.prompt.cache_eligible = task.type == SERVER_TASK_TYPE_COMPLETION && task.params.cache_prompt;
+        slot.prompt.cache_reusable = can_reuse || (task.is_child() && task.params.cache_prompt);
+        if (prompt_cache) {
+            prompt_cache->update();
         }
 
         // the per-request limit takes priority over the global one
@@ -2419,12 +2385,13 @@ private:
                             if (!slot.is_processing()) {
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
-                                if (slot.prompt_save(*prompt_cache)) {
+                                const bool saved = slot.prompt_save(*prompt_cache);
+                                if (saved) {
                                     SLT_DBG(slot, "%s", "__TEST_TAG_CACHE_IDLE_SLOT__\n");
                                     prompt_cache->update();
                                 }
 
-                                if (params_base.kv_unified) {
+                                if (params_base.kv_unified && (saved || !slot.prompt.cache_eligible)) {
                                     // [TAG_IDLE_SLOT_CLEAR]
                                     slot.prompt_clear();
                                 }
@@ -2619,6 +2586,8 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+                        slot->prompt.cache_eligible = true;
+                        slot->prompt.cache_reusable = true;
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
@@ -3271,12 +3240,6 @@ private:
 
                             llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
 
-                            // ref: https://github.com/ggml-org/llama.cpp/pull/24110
-                            const bool has_new_tokens = (n_past < slot.task->n_tokens());
-
-                            // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - (has_new_tokens ? 0 : 1));
-
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
@@ -3327,43 +3290,17 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
-                                    // search for a context checkpoint
-                                    const auto it = std::find_if(
-                                        slot.prompt.checkpoints.rbegin(),
-                                        slot.prompt.checkpoints.rend(),
-                                        [&](const auto & cur) {
-                                            // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
-                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
-                                            if (cur.pos_max > pos_next) {
-                                                return false;
-                                            }
-                                            return cur.pos_min < pos_min_thold || cur.pos_min == 0;
-                                        }
-                                    );
-
-                                    bool do_reset = it == slot.prompt.checkpoints.rend();
-
-                                    if (!do_reset) {
-                                        // restore the context checkpoint
-                                        it->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-                                        // restore the draft's speculative state
-                                        common_speculative_set_state(spec.get(), slot.id, it->data_spec);
-
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
-                                        SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
-                                    }
-
-                                    if (do_reset) {
-                                        SLT_TRC(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
-                                                "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
-                                        n_past = 0;
-                                    }
+                                const auto plan = slot.prompt.plan_reuse(n_past, slot.task->n_tokens(), pos_min, n_swa);
+                                if (plan.checkpoint) {
+                                    plan.checkpoint->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    plan.checkpoint->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                    common_speculative_set_state(spec.get(), slot.id, plan.checkpoint->data_spec);
+                                    SLT_TRC(slot, "restored context checkpoint, n_past = %zu\n", plan.n_past);
+                                } else if (plan.n_past == 0) {
+                                    SLT_TRC(slot, "%s", "forcing full prompt re-processing due to lack of cache data\n");
                                 }
+                                pos_next = plan.pos_next;
+                                n_past = plan.n_past;
                             }
 
                             {

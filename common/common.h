@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 #include <map>
+#include <memory>
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -1229,6 +1230,25 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+class common_shared_state_buffer {
+public:
+    size_t size() const { return storage ? storage->size() : 0; }
+    bool empty() const { return size() == 0; }
+    const uint8_t * data() const { return storage ? storage->data() : nullptr; }
+
+    uint8_t * reset(size_t size) {
+        auto next = std::make_shared<std::vector<uint8_t>>(size);
+        storage = std::move(next);
+        return storage->data();
+    }
+
+    void clear() { storage.reset(); }
+    bool shares_storage(const common_shared_state_buffer & other) const { return storage == other.storage; }
+
+private:
+    std::shared_ptr<std::vector<uint8_t>> storage;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1238,8 +1258,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_shared_state_buffer data_tgt;
+    common_shared_state_buffer data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)
