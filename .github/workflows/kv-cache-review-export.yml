@@ -1,0 +1,31 @@
+name: Cache review source export
+
+on:
+  push:
+    branches: [design/issue-1-kv-cache-retention]
+    paths: [.github/workflows/kv-cache-review-export.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    if: github.repository == 'novkien/llama.cpp-fork'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Export tracked review source
+        run: |
+          mkdir -p "${RUNNER_TEMP}/cache-review"
+          git rev-parse HEAD > "${RUNNER_TEMP}/cache-review/HEAD.txt"
+          git archive --format=tar.gz HEAD > "${RUNNER_TEMP}/cache-review/source.tar.gz"
+          sha256sum "${RUNNER_TEMP}/cache-review/source.tar.gz" > "${RUNNER_TEMP}/cache-review/SHA256SUMS"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cache-review-source
+          path: ${{ runner.temp }}/cache-review/
+          retention-days: 1
+          if-no-files-found: error
