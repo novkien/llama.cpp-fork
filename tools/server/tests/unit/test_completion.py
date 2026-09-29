@@ -2,6 +2,9 @@ import pytest
 import requests
 import time
 import random
+import os
+import socket
+from pathlib import Path
 
 from openai import OpenAI
 from utils import *
@@ -666,3 +669,138 @@ def test_completion_prompt_cache():
         assert "prompt_n" in timings and timings["prompt_n"] + timings["cache_n"] == n_prompt
         assert "predicted_n" in timings and timings["predicted_n"] == n_predict
         assert "tokens" in res.body and isinstance(res.body["tokens"], list)
+
+
+@pytest.fixture
+def cache_retention_server(tmp_path):
+    global server
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        server.server_port = probe.getsockname()[1]
+    server.debug = True
+    server.n_ctx = 4096
+    server.n_batch = 512
+    server.n_slots = 2
+    server.cache_ram = 64
+    server.no_cache_idle_slots = True
+    server.temperature = 0.0
+    server.log_path = str(tmp_path / "cache.log")
+    # A local model permits a focused offline run without downloading every preset.
+    model = os.environ.get("LLAMA_CACHE_TEST_MODEL")
+    if model:
+        server.model_file = model
+        server.model_hf_repo = None
+        server.model_hf_file = None
+    yield server
+    server.stop()
+
+
+def cache_retention_complete(tokens, id_slot, cache_prompt=True, n_predict=0):
+    data = {
+        "prompt": tokens, "cache_prompt": cache_prompt,
+        "n_predict": n_predict, "temperature": 0, "ignore_eos": True,
+        "return_tokens": True,
+    }
+    if id_slot is not None:
+        data["id_slot"] = id_slot
+    result = server.make_request("POST", "/completion", data=data)
+    assert result.status_code == 200, result.body
+    timings = result.body["timings"]
+    assert timings["cache_n"] + timings["prompt_n"] == len(tokens)
+    return result.body
+
+
+@pytest.mark.parametrize("similarity", [0.0, 0.1])
+def test_cache_retention_pinned_empty(cache_retention_server, similarity):
+    server.slot_prompt_similarity = similarity
+    server.start()
+    a = [11, 12, 13, 14] * 64
+    x = [71, 72, 73, 74] * 64
+    assert cache_retention_complete(a, 0)["timings"]["cache_n"] == 0
+    cache_retention_complete(x, 0)
+    restored = cache_retention_complete(a + [31, 32, 33], 1)
+    assert restored["timings"]["cache_n"] >= len(a) - 1
+
+
+@pytest.mark.parametrize("similarity", [0.0, 0.1])
+@pytest.mark.parametrize("id_slot", [0, None])
+def test_cache_retention_borrowed_snapshot(cache_retention_server, similarity, id_slot):
+    server.slot_prompt_similarity = similarity
+    server.n_slots = 1
+    server.start()
+    common = [11, 12, 13, 14] * 48
+    a = common + [21, 22, 23, 24] * 32
+    x = [71, 72, 73, 74] * 80
+    c = common + [41, 42, 43, 44] * 32
+    cache_retention_complete(a, id_slot)
+    cache_retention_complete(x, id_slot)
+    borrowed = cache_retention_complete(c, id_slot)
+    assert borrowed["timings"]["cache_n"] == len(common)
+    resumed = cache_retention_complete(a + [51, 52, 53], id_slot, n_predict=8)
+    assert resumed["timings"]["cache_n"] >= len(a) - 1
+    cold = cache_retention_complete(a + [51, 52, 53], id_slot, cache_prompt=False, n_predict=8)
+    assert cold["timings"]["cache_n"] == 0
+    assert resumed["tokens"] == cold["tokens"]
+
+
+def test_cache_retention_low_fraction_prefix(cache_retention_server):
+    server.start()
+    common = [11, 12, 13, 14] * 12
+    a = common + [21, 22, 23, 24] * 88
+    x = [71, 72, 73, 74] * 80
+    c = common + [41, 42, 43, 44] * 32
+    cache_retention_complete(a, 0)
+    cache_retention_complete(x, 0)
+    assert cache_retention_complete(c, 1)["timings"]["cache_n"] == len(common)
+
+
+def test_cache_retention_opt_out(cache_retention_server):
+    server.start()
+    a = [11, 12, 13, 14] * 64
+    x = [71, 72, 73, 74] * 64
+    cache_retention_complete(a, 0, cache_prompt=False)
+    cache_retention_complete(x, 0)
+    assert cache_retention_complete(a, 1)["timings"]["cache_n"] == 0
+
+
+def test_cache_retention_warm_append_does_not_save(cache_retention_server):
+    server.start()
+    a = [11, 12, 13, 14] * 64
+    cache_retention_complete(a, 0)
+    # Raw token arrays avoid a text re-tokenization mismatch at the append boundary.
+    cache_retention_complete(a + [31, 32, 33], 0)
+    log = Path(server.log_path).read_text()
+    assert "preserved prompt with" not in log
+
+
+@pytest.mark.parametrize("similarity", [0.0, 0.1])
+def test_cache_retention_idle_evacuation(cache_retention_server, similarity):
+    server.no_cache_idle_slots = False
+    server.kv_unified = True
+    server.server_slots = True
+    server.slot_prompt_similarity = similarity
+    server.start()
+    a = [11, 12, 13, 14] * 64
+    cache_retention_complete(a, 0)
+    cache_retention_complete([71, 72, 73, 74] * 64, 1)
+    status = server.make_request("GET", "/slots")
+    assert status.status_code == 200
+    slot = next(item for item in status.body if item["id"] == 0)
+    assert slot["n_prompt_tokens"] == 0
+    assert cache_retention_complete(a + [31, 32, 33], 0)["timings"]["cache_n"] >= len(a) - 1
+
+
+def test_cache_retention_failed_idle_save_keeps_live_state(cache_retention_server):
+    server.no_cache_idle_slots = False
+    server.kv_unified = True
+    server.server_slots = True
+    server.cache_ram = 1
+    server.start()
+    a = [11, 12, 13, 14] * 500
+    cache_retention_complete(a, 0)
+    cache_retention_complete([71, 72, 73, 74] * 64, 1)
+    status = server.make_request("GET", "/slots")
+    assert status.status_code == 200
+    slot = next(item for item in status.body if item["id"] == 0)
+    assert slot["n_prompt_tokens"] == len(a)
+    assert cache_retention_complete(a + [31, 32, 33], 0)["timings"]["cache_n"] >= len(a) - 1

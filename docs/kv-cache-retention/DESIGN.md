@@ -1,6 +1,6 @@
 # Branch-preserving RAM cache with optional SSD spill
 
-Status: implementation design for [issue 1](https://github.com/novkien/llama.cpp-fork/issues/1), not implemented. Source baseline: `526c43b8f7dfea9032e9f35e7a1be9183ca7cc20`. Evidence and upstream comparisons are in [RESEARCH.md](RESEARCH.md); execution instructions are in [IMPLEMENTATION.md](IMPLEMENTATION.md).
+Status: target architecture for [issue 1](https://github.com/novkien/llama.cpp-fork/issues/1). The RAM subset is implemented; SSD and broader acceptance remain pending. [README.md](README.md) records the current delivery boundary. Source baseline: `526c43b8f7dfea9032e9f35e7a1be9183ca7cc20`. Evidence and upstream comparisons are in [RESEARCH.md](RESEARCH.md); execution instructions are in [IMPLEMENTATION.md](IMPLEMENTATION.md).
 
 ## 1. Requirements and scope
 
@@ -18,11 +18,11 @@ R5. Bound RAM, pending I/O, metadata and disk usage; preserve normal concurrency
 
 R6. Keep normal append-only continuations cheap. Do not capture full KV on every request, force every request through a file or turn this into a proxy-side `/slots` RPC loop.
 
-The current draft contains documentation only. Future implementation includes the RAM path and SSD path described here, but not a CUDA/kernel rewrite, distributed cache, cross-machine portability guarantee, compression, native model recovery, or proxy scheduling changes. `llama-proxy#419` recovery/order work and `#386` admission optimizations are not silently incorporated. Future proxy pinning integration remains separate.
+The branch now contains a RAM-path implementation. The complete target includes the RAM and SSD paths described here, but not a CUDA/kernel rewrite, distributed cache, cross-machine portability guarantee, compression, native model recovery, or proxy scheduling changes. `llama-proxy#419` recovery/order work and `#386` admission optimizations are not silently incorporated. Future proxy pinning integration remains separate.
 
 ## 2. Existing mechanism and required changes
 
-The inspected `get_available_slot()` gates both save and load with `update_cache`; selected-slot saving normally depends on `f_keep < 0.5` or the LRU path. Pinned empty slots can miss this gate. The caller checks busy state after selection. `server_prompt_cache::load()` restores and then consumes the saved entry. Allocation deduplicates by token-prefix containment, which does not prove checkpoint coverage. These are source findings, not newly observed runtime incidents.
+The original baseline `get_available_slot()` gates both save and load with `update_cache`; selected-slot saving normally depends on `f_keep < 0.5` or the LRU path. Pinned empty slots can miss this gate. The caller checks busy state after selection. `server_prompt_cache::load()` restores and then consumes the saved entry. Allocation deduplicates by token-prefix containment, which does not prove checkpoint coverage. These are source findings, not newly observed runtime incidents.
 
 Reuse the existing `server_prompt_cache`, `server_tokens`, `common_prompt_checkpoint` and `llama_state_seq_*_ext` APIs. Do not create a second cache manager. Add a small storage/codec helper for disk operations; it must not own or access live llama contexts.
 

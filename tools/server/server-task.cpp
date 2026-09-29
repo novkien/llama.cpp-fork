@@ -11,6 +11,8 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <limits>
+#include <stdexcept>
 
 //
 // task_params
@@ -1708,161 +1710,187 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
-    // first check if the current state is contained fully in the cache
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (cur_lcp_len == (int) prompt.tokens.size()) {
-            SRV_TRC("%s", " - prompt is already in the cache, skipping\n");
-            return nullptr;
-        }
+server_prompt_reuse server_prompt::plan_reuse(size_t prefix, size_t n_input, llama_pos pos_min, int32_t n_swa) const {
+    server_prompt_reuse plan;
+    plan.n_past = std::min(prefix, tokens.size());
+    plan.pos_next = tokens.pos_next(plan.n_past);
+    if (plan.n_past == 0) {
+        return plan;
+    }
+    if (pos_min < 0) {
+        return {};
     }
 
-    // calculate checkpoints size to see if it will fit with the prompt
-    size_t checkpoints_size = 0;
-    for (const auto & ckpt : prompt.checkpoints) {
-        checkpoints_size += ckpt.size();
+    const bool has_new_tokens = plan.n_past < n_input;
+    const llama_pos threshold = std::max(0, plan.pos_next - n_swa - (has_new_tokens ? 0 : 1));
+    if (pos_min < threshold) {
+        return plan;
     }
 
-    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
-
-    // skip over-limit entries to avoid disturbing the cache
-    if (limit_size > 0 && state_size_new > limit_size) {
-        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
-                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
-        return nullptr;
-    }
-
-    // remove any cached prompts that are fully contained in the current prompt
-    for (auto it = states.begin(); it != states.end();) {
-        const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
-
-        if (len == (int) it->prompt.tokens.size()) {
-            SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
-
-            it = states.erase(it);
-        } else {
-            ++it;
-        }
-    }
-
-    if (limit_size > 0) {
-        // make room before allocating the new vectors to avoid breaching the limit
-        while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
-
-            states.pop_front();
-        }
-    }
-
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
-
-    // check if we can allocate enough memory for the new state
-    try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
-    } catch (const std::bad_alloc & e) {
-        SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
-
-        limit_size = std::max<size_t>(1, 0.4*size());
-
-        SRV_WRN(" - cache size limit reduced to %.3f MiB\n", limit_size / (1024.0 * 1024.0));
-
-        update();
-
-        return nullptr;
-    }
-
-    states.push_back({
-        /*.prompt =*/ {
-            /*.tokens      =*/ prompt.tokens.clone(),
-            /*.checkpoints =*/ prompt.checkpoints,
-        },
-        /*.data   =*/ {
-            /*.main =*/ std::move(state_data_tgt),
-            /*.drft =*/ std::move(state_data_dft),
-        },
-    });
-
-    return &states.back();
-}
-
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
-    const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
-
-    int lcp_win = lcp_best;
-
-    SRV_TRC(" - looking for better prompt, base lcp = %d\n", lcp_best);
-
-    auto it_best = states.end();
-
-    // find the cached prompt with the longest reusable prefix
-    for (auto it = states.begin(); it != states.end(); ++it) {
-        const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
-
-        const float f_keep_cur = it->prompt.tokens.empty() ? 0.0f : float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = tokens_new.empty() ? 0.0f : float(lcp_cur) / tokens_new.size();
-
-        SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
-
-        // don't trash large prompts
-        if (f_keep_cur < 0.25f) {
+    for (auto it = checkpoints.rbegin(); it != checkpoints.rend(); ++it) {
+        if (it->pos_max > plan.pos_next || (it->pos_min >= threshold && it->pos_min != 0)) {
             continue;
         }
+        plan.checkpoint = &*it;
+        plan.pos_next = std::min(plan.pos_next, std::max(it->pos_min + 1, it->pos_max));
+        plan.n_past = std::min(tokens.size_up_to_pos(plan.pos_next), (size_t) it->n_tokens);
+        return plan;
+    }
+    return {};
+}
 
-        if (lcp_cur > lcp_win) {
-            lcp_win = lcp_cur;
+const server_prompt_cache_state * server_prompt_cache::find_best(const server_prompt & prompt,
+        const server_tokens & tokens_new, llama_pos pos_min, int32_t n_swa,
+        const std::vector<common_adapter_lora_info> & lora, size_t reuse_limit) const {
+    const size_t prefix = std::min(prompt.tokens.get_common_prefix(tokens_new), reuse_limit);
+    size_t best = prompt.plan_reuse(prefix, tokens_new.size(), pos_min, n_swa).usable_tokens(tokens_new.size());
+    const server_prompt_cache_state * result = nullptr;
 
-            it_best = it;
+    for (const auto & state : states) {
+        // A shorter entry cannot beat the resident state. Avoid a full prefix scan on warm turns.
+        if (state.prompt.tokens.size() <= best || !are_lora_equal(state.lora, lora)) {
+            continue;
+        }
+        const size_t lcp = std::min(state.prompt.tokens.get_common_prefix(tokens_new), reuse_limit);
+        const auto plan = state.prompt.plan_reuse(lcp, tokens_new.size(), state.pos_min, n_swa);
+        const size_t reusable = plan.usable_tokens(tokens_new.size());
+        if (reusable > best || (result && reusable == best)) {
+            best = reusable;
+            result = &state;
         }
     }
+    return result;
+}
 
-    if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with lcp = %d (base %d)\n", lcp_win, lcp_best);
-
-        {
-            auto & data = it_best->data.main;
-
-            const size_t size = data.size();
-            const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
-            if (n != size) {
-                SRV_ERR("failed to restore state with size %zu\n", size);
-
-                return false;
-            }
-
-            data.clear();
-            data.shrink_to_fit();
-        }
-
-        {
-            auto & data = it_best->data.drft;
-
-            if (!data.empty()) {
-                GGML_ASSERT(ctx_dft);
-
-                const size_t size = data.size();
-                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
-                if (n != size) {
-                    SRV_WRN("failed to restore state with size %zu\n", size);
-
-                    return false;
-                }
-
-                data.clear();
-                data.shrink_to_fit();
-            }
-        }
-
-        prompt = std::move(it_best->prompt);
-
-        states.erase(it_best);
+static bool server_prompt_checkpoints_equal(const server_prompt & a, const server_prompt & b) {
+    if (a.checkpoints.size() != b.checkpoints.size()) {
+        return false;
     }
-
+    auto ai = a.checkpoints.begin();
+    auto bi = b.checkpoints.begin();
+    for (; ai != a.checkpoints.end(); ++ai, ++bi) {
+        if (ai->n_tokens != bi->n_tokens || ai->pos_min != bi->pos_min || ai->pos_max != bi->pos_max ||
+                !ai->data_tgt.shares_storage(bi->data_tgt) || !ai->data_dft.shares_storage(bi->data_dft) ||
+                ai->data_spec != bi->data_spec) {
+            return false;
+        }
+    }
     return true;
+}
+
+server_prompt_save_result server_prompt_cache::save(const server_prompt & prompt,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+        const std::vector<common_adapter_lora_info> & lora, common_speculative * spec,
+        const server_prompt_cache_state * keep) {
+    if (prompt.tokens.empty() || !prompt.cache_eligible) {
+        return SERVER_PROMPT_NOT_CACHED;
+    }
+
+    try {
+        const auto memory = llama_get_memory(ctx_tgt);
+        const llama_pos pos_min = llama_memory_seq_pos_min(memory, id_slot);
+        const llama_pos pos_max = llama_memory_seq_pos_max(memory, id_slot);
+        if (pos_min < 0 || pos_max < pos_min) {
+            return SERVER_PROMPT_SAVE_FAILED;
+        }
+        std::vector<uint8_t> spec_state;
+        common_speculative_get_state(spec, id_slot, spec_state);
+        for (auto & state : states) {
+            if (state.pos_min == pos_min && state.pos_max == pos_max && are_lora_equal(state.lora, lora) &&
+                    state.prompt.tokens.size() == prompt.tokens.size() &&
+                    state.prompt.tokens.get_common_prefix(prompt.tokens) == prompt.tokens.size() &&
+                    server_prompt_checkpoints_equal(state.prompt, prompt) && state.data.spec == spec_state) {
+                return SERVER_PROMPT_ALREADY_SAVED;
+            }
+        }
+
+        const size_t n_tgt = llama_state_seq_get_size_ext(ctx_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t n_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+        if (n_tgt == 0 || (ctx_dft && n_dft == 0)) {
+            return SERVER_PROMPT_SAVE_FAILED;
+        }
+        size_t required = spec_state.size();
+        const auto add_size = [&](size_t n) {
+            if (n > std::numeric_limits<size_t>::max() - required) {
+                throw std::length_error("prompt cache size overflow");
+            }
+            required += n;
+        };
+        add_size(n_tgt);
+        add_size(n_dft);
+        for (const auto & ckpt : prompt.checkpoints) {
+            add_size(ckpt.size());
+        }
+        if (limit_size > 0 && (required > limit_size || (keep && keep->size() > limit_size - required))) {
+            SRV_WRN("%s", "prompt cache capture rejected by byte budget\n");
+            return SERVER_PROMPT_SAVE_FAILED;
+        }
+
+        // Allocate metadata before evicting anything; keep the entry private until capture succeeds.
+        std::list<server_prompt_cache_state> pending;
+        pending.emplace_back();
+        auto & entry = pending.back();
+        entry.prompt = prompt.clone();
+        entry.lora = lora;
+        entry.pos_min = pos_min;
+        entry.pos_max = pos_max;
+        entry.data.spec = std::move(spec_state);
+        if (limit_size > 0) {
+            while (size() > limit_size - required) {
+                auto victim = states.begin();
+                while (victim != states.end() && &*victim == keep) {
+                    ++victim;
+                }
+                if (victim == states.end()) {
+                    return SERVER_PROMPT_SAVE_FAILED;
+                }
+                SRV_WRN(" - prompt cache byte budget: evicting %zu bytes\n", victim->size());
+                states.erase(victim);
+            }
+        }
+        entry.data.main.resize(n_tgt);
+        entry.data.drft.resize(n_dft);
+        if (llama_state_seq_get_data_ext(ctx_tgt, entry.data.main.data(), n_tgt, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != n_tgt ||
+                (ctx_dft && llama_state_seq_get_data_ext(ctx_dft, entry.data.drft.data(), n_dft, id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != n_dft)) {
+            SRV_WRN("%s", "prompt cache capture failed: incomplete state\n");
+            return SERVER_PROMPT_SAVE_FAILED;
+        }
+        states.splice(states.end(), pending);
+        SRV_TRC(" - preserved prompt with %zu tokens, %zu bytes\n", prompt.tokens.size(), required);
+        return SERVER_PROMPT_SAVED;
+    } catch (const std::exception & e) {
+        SRV_WRN("prompt cache capture failed: %s\n", e.what());
+        return SERVER_PROMPT_SAVE_FAILED;
+    }
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_prompt_cache_state & state,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec) {
+    try {
+        server_prompt restored = state.prompt.clone();
+        const auto & main = state.data.main;
+        const auto & draft = state.data.drft;
+        if (main.empty() || bool(ctx_dft) != !draft.empty()) {
+            return false;
+        }
+        if (llama_state_seq_set_data_ext(ctx_tgt, main.data(), main.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != main.size() ||
+                (ctx_dft && llama_state_seq_set_data_ext(ctx_dft, draft.data(), draft.size(), id_slot, LLAMA_STATE_SEQ_FLAGS_NONE) != draft.size())) {
+            return false;
+        }
+        common_speculative_set_state(spec, id_slot, state.data.spec);
+        prompt = std::move(restored);
+        // A successful read changes recency, not ownership of the immutable source.
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (&*it == &state) {
+                states.splice(states.end(), states, it);
+                break;
+            }
+        }
+        return true;
+    } catch (const std::exception & e) {
+        SRV_WRN("prompt cache restore failed: %s\n", e.what());
+        return false;
+    }
 }
 
 void server_prompt_cache::update() {

@@ -1,6 +1,33 @@
 # Verification plan and acceptance evidence
 
-Status: all implementation results are **NOT RUN** in the documentation draft. The table specifies required tests, not claimed passes. Use the maintained server pytest harness and disposable files/ports. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for setup.
+Status: the CPU RAM-path results below are verified. The complete T01-T24 table remains an acceptance plan, not a blanket PASS; SSD, real hybrid/GPU/MTP/media and exhaustive failure injection are still unverified. Use the maintained server pytest harness and disposable files/ports. See [IMPLEMENTATION.md](IMPLEMENTATION.md) for setup.
+
+## Current review evidence (2026-09-29)
+
+- Baseline native source: owner commit `8cfa7bb52fe69e904abc53c86b775c01a6ec3b0b`. Temporary export-only commits did not change native bytes. Baseline and repaired builds used GCC 14.2.0, CMake 3.31.6, Release, CPU, `GGML_NATIVE=OFF`, `LLAMA_FATAL_WARNINGS=ON`, and no embedded UI in an offline disposable environment.
+- Model: public `tinyllamas/stories260K.gguf`, 1,185,376 bytes, SHA-256 `270cba1bd5109f42d03350f60406024560464db173c0e387d91f0426d3bd256d`.
+- New HTTP cache regressions: **12 passed** on the repair, compared with **7 failed / 5 passed** on the initial owner patch. The failing baseline cases were borrowed-snapshot loss in automatic and explicit-slot modes at both similarity settings, the 25% exclusion, opt-out archiving, and failed idle save followed by clear.
+- Expanded existing completion/manual text-slot regressions plus the new cases: **53 passed, 1 skipped, 1 slow test excluded**. The excluded test requires a different Phi model; it was not claimed tested using the tiny model. The harness timing override is not evidence of production throughput.
+- `test-server-prompt-cache`: **18 model-independent checks** for actual planner behavior and immutable ownership; **33 checks total** with the same tiny model supplied, including native capture, duplicate capture, protected-candidate byte-budget rejection, cross-slot restore, non-consumption, draft-state mismatch rejection before installation and cache opt-out. Its CTest registration passed.
+- Build and `git diff --check` passed. These are source-level/isolated results, not a deployed native or GPU acceptance report.
+
+The focused HTTP cases use a supplied local model and ephemeral loopback ports. This command avoids the parent conftest's all-model preload while running the maintained completion test module and each cache fixture's own teardown:
+
+```bash
+ROOT="$(git rev-parse --show-toplevel)"
+MODEL="/absolute/path/to/stories260K.gguf"
+BUILD="/absolute/path/to/disposable-build"
+cmake --build "$BUILD" --target llama-server test-server-prompt-cache -j2
+ctest --test-dir "$BUILD" -R '^test-server-prompt-cache$' --output-on-failure
+"$BUILD/bin/test-server-prompt-cache" "$MODEL"
+LLAMA_CACHE_TEST_MODEL="$MODEL" \
+LLAMA_SERVER_BIN_PATH="$BUILD/bin/llama-server" \
+PYTHONPATH="$ROOT/tools/server/tests" \
+python -m pytest --confcutdir="$ROOT/tools/server/tests/unit" \
+  "$ROOT/tools/server/tests/unit/test_completion.py" -k cache_retention -q
+```
+
+When comparing separate builds that use shared libraries, point `LD_LIBRARY_PATH` at that build's own `bin` directory so a baseline executable cannot accidentally load repaired libraries. On other platforms use the corresponding library-resolution mechanism. Keep `cache_ram=0` and a process restart for any future disk-only test so RAM cannot mask a broken file path.
 
 ## 1. Evidence rules
 

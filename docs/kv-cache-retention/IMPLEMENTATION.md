@@ -1,6 +1,6 @@
 # Junior implementation guide
 
-This is an ordered implementation guide, not an implemented patch. Complete the RAM and SSD slices on the draft branch. Keep [DESIGN.md](DESIGN.md) authoritative for behavior and [TESTING.md](TESTING.md) authoritative for evidence. Names introduced below are proposed names.
+This is the ordered guide for the complete architecture. The RAM repair is now in source; read [README.md](README.md) for implemented coverage and [TESTING.md](TESTING.md) for actual results before continuing the remaining slices. SSD is not implemented. Keep [DESIGN.md](DESIGN.md) authoritative for behavior and [TESTING.md](TESTING.md) authoritative for evidence. Names introduced below are proposed names.
 
 ## 0. Establish a safe local starting point
 
@@ -19,7 +19,7 @@ The intended repository is `novkien/llama.cpp-fork`, not `ggml-org/llama.cpp` or
 
 A fresh clone is an optional way to get this draft without disturbing an existing checkout. Use the head branch shown by the actual PR. Do not push an upstream PR as a side effect of working on this fork.
 
-Read root/scoped AGENTS, CONTRIBUTING, `tools/server/README-dev.md` and `tools/server/tests/README.md`. The current owner request authorizes this fork's design workspace and draft publication; implementation and production activation must be reported separately. Keep complete source files, not placeholder stubs or intentionally failing TODO binaries, in implementation commits.
+Read root/scoped AGENTS, CONTRIBUTING, `tools/server/README-dev.md` and `tools/server/tests/README.md`. The owner subsequently authorized direct review repairs on the fork PR and retained merge/build/live-trial responsibility. Source repair and production activation are separate actions. Keep complete source files, not placeholder stubs or intentionally failing TODO binaries, in implementation commits.
 
 ## 1. Read the source in execution order
 
