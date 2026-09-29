@@ -1793,19 +1793,18 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
-    float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
-    float f_sim_best  = float(lcp_best) / tokens_new.size();
+    int lcp_win = lcp_best;
 
-    SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+    SRV_TRC(" - looking for better prompt, base lcp = %d\n", lcp_best);
 
     auto it_best = states.end();
 
-    // find the most similar cached prompt, that would also preserve the most context
+    // find the cached prompt with the longest reusable prefix
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp_cur = it->prompt.tokens.get_common_prefix(tokens_new);
 
-        const float f_keep_cur = float(lcp_cur) / it->prompt.tokens.size();
-        const float f_sim_cur  = float(lcp_cur) / tokens_new.size();
+        const float f_keep_cur = it->prompt.tokens.empty() ? 0.0f : float(lcp_cur) / it->prompt.tokens.size();
+        const float f_sim_cur  = tokens_new.empty() ? 0.0f : float(lcp_cur) / tokens_new.size();
 
         SRV_TRC("   - prompt with length %7zu, lcp = %7d, f_keep = %.3f, f_sim = %.3f\n", it->prompt.tokens.size(), lcp_cur, f_keep_cur, f_sim_cur);
 
@@ -1814,16 +1813,15 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
-            f_keep_best = f_keep_cur;
-            f_sim_best  = f_sim_cur;
+        if (lcp_cur > lcp_win) {
+            lcp_win = lcp_cur;
 
             it_best = it;
         }
     }
 
     if (it_best != states.end()) {
-        SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+        SRV_TRC(" - found better prompt with lcp = %d (base %d)\n", lcp_win, lcp_best);
 
         {
             auto & data = it_best->data.main;

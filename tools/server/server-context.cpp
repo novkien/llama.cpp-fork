@@ -1528,8 +1528,6 @@ private:
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
-        bool update_cache = false;
-
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
             ret = get_slot_by_id(task.id_slot);
@@ -1582,11 +1580,6 @@ private:
                     SLT_INF(*ret, "selected slot by LCP similarity, f_sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                             f_sim_best, slot_prompt_similarity, f_keep);
                 }
-
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
-                    update_cache = true;
-                }
             }
         }
 
@@ -1609,23 +1602,22 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
-
-                update_cache = true;
             }
         }
 
         if (ret) {
-            update_cache = update_cache && prompt_cache;
+            const bool can_cache = prompt_cache && task.type == SERVER_TASK_TYPE_COMPLETION && !ret->is_processing();
 
-            // cache prompts only for completion tasks
-            update_cache = update_cache && task.type == SERVER_TASK_TYPE_COMPLETION;
-
-            if (update_cache) {
+            if (can_cache) {
                 SRV_TRC("%s", "updating prompt cache\n");
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                // save when reuse would discard live tokens
+                const size_t lcp_slot = ret->prompt.tokens.get_common_prefix(task.tokens);
+                if (!ret->prompt.tokens.empty() && lcp_slot < ret->prompt.tokens.size()) {
+                    ret->prompt_save(*prompt_cache);
+                }
 
                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
