@@ -14,21 +14,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Collect public test assets
+      - name: Collect Python 3.13 wheels
         run: |
           mkdir -p "${RUNNER_TEMP}/cache-review/wheels"
-          git rev-parse HEAD > "${RUNNER_TEMP}/cache-review/HEAD.txt"
-          curl --fail --location --retry 2 --max-time 90 \
-            https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf \
-            -o "${RUNNER_TEMP}/cache-review/stories260K.gguf"
-          python -m pip download --dest "${RUNNER_TEMP}/cache-review/wheels" 'wget==3.2' 'openai~=2.14.0' 'pytest-xdist~=3.6'
-          sha256sum "${RUNNER_TEMP}/cache-review/stories260K.gguf" > "${RUNNER_TEMP}/cache-review/SHA256SUMS"
+          python -m pip download --dest "${RUNNER_TEMP}/cache-review/wheels" \
+            --only-binary=:all: --python-version 313 --platform manylinux2014_x86_64 --implementation cp --abi cp313 'jiter>=0.10,<1'
       - uses: actions/upload-artifact@v4
         with:
-          name: cache-review-test-assets
+          name: cache-review-python313
           path: ${{ runner.temp }}/cache-review/
           retention-days: 1
           if-no-files-found: error
