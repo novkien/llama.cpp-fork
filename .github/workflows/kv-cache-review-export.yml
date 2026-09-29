@@ -17,15 +17,18 @@ jobs:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Export tracked review source
+      - name: Collect public test assets
         run: |
-          mkdir -p "${RUNNER_TEMP}/cache-review"
+          mkdir -p "${RUNNER_TEMP}/cache-review/wheels"
           git rev-parse HEAD > "${RUNNER_TEMP}/cache-review/HEAD.txt"
-          git archive --format=tar.gz HEAD > "${RUNNER_TEMP}/cache-review/source.tar.gz"
-          sha256sum "${RUNNER_TEMP}/cache-review/source.tar.gz" > "${RUNNER_TEMP}/cache-review/SHA256SUMS"
+          curl --fail --location --retry 2 --max-time 90 \
+            https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories260K.gguf \
+            -o "${RUNNER_TEMP}/cache-review/stories260K.gguf"
+          python -m pip download --dest "${RUNNER_TEMP}/cache-review/wheels" 'wget==3.2' 'openai~=2.14.0' 'pytest-xdist~=3.6'
+          sha256sum "${RUNNER_TEMP}/cache-review/stories260K.gguf" > "${RUNNER_TEMP}/cache-review/SHA256SUMS"
       - uses: actions/upload-artifact@v4
         with:
-          name: cache-review-source
+          name: cache-review-test-assets
           path: ${{ runner.temp }}/cache-review/
           retention-days: 1
           if-no-files-found: error
