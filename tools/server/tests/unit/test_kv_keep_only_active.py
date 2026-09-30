@@ -76,7 +76,8 @@ def test_clear_and_restore():
         "cache_prompt": True,
     })
     assert res.status_code == 200
-    assert "updating prompt cache" in log.drain()
+    log.drain()
+    assert res.body["timings"]["cache_n"] >= original_prompt_n - 1
     assert res.body["timings"]["cache_n"] > 0
     assert res.body["timings"]["prompt_n"] < original_prompt_n
 

@@ -563,10 +563,24 @@ struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
 
+struct server_prompt_reuse {
+    size_t n_past = 0;
+    llama_pos pos_next = 0;
+    const common_prompt_checkpoint * checkpoint = nullptr;
+
+    size_t usable_tokens(size_t n_input) const {
+        return n_past == n_input && n_past > 0 ? n_past - 1 : n_past;
+    }
+};
+
 struct server_prompt {
     server_tokens tokens;
 
     std::list<common_prompt_checkpoint> checkpoints;
+    bool cache_eligible = true;
+    bool cache_reusable = true;
+
+    server_prompt_reuse plan_reuse(size_t prefix, size_t n_input, llama_pos pos_min, int32_t n_swa) const;
 
     void clear() {
         tokens.clear();
@@ -581,6 +595,8 @@ struct server_prompt {
         return server_prompt {
             tokens.clone(),
             checkpoints,
+            cache_eligible,
+            cache_reusable,
         };
     }
 };
@@ -588,15 +604,19 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec;
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+    std::vector<common_adapter_lora_info> lora;
+    llama_pos pos_min = -1;
+    llama_pos pos_max = -1;
 
     size_t size() const {
         size_t res = data.size();
@@ -608,6 +628,15 @@ struct server_prompt_cache_state {
         return res;
     }
 };
+
+enum server_prompt_save_result {
+    SERVER_PROMPT_SAVED,
+    SERVER_PROMPT_ALREADY_SAVED,
+    SERVER_PROMPT_NOT_CACHED,
+    SERVER_PROMPT_SAVE_FAILED,
+};
+
+struct common_speculative;
 
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
@@ -627,9 +656,16 @@ struct server_prompt_cache {
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    const server_prompt_cache_state * find_best(const server_prompt & prompt, const server_tokens & tokens_new,
+            llama_pos pos_min, int32_t n_swa, const std::vector<common_adapter_lora_info> & lora,
+            size_t reuse_limit) const;
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    server_prompt_save_result save(const server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft,
+            int32_t id_slot, const std::vector<common_adapter_lora_info> & lora, common_speculative * spec,
+            const server_prompt_cache_state * keep = nullptr);
+
+    bool load(server_prompt & prompt, const server_prompt_cache_state & state,
+            llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot, common_speculative * spec);
 
     void update();
 };
