@@ -307,6 +307,10 @@ The environment variable `GGML_CUDA_P2P` can be set to enable peer-to-peer acces
 Requires driver support (usually restricted to workstation/datacenter GPUs).
 May cause crashes or corrupted outputs for some motherboards and BIOS settings (e.g. IOMMU).
 
+For selective NVIDIA CUDA layer transfers, set `GGML_CUDA_P2P_PAIRS` to a nonempty comma-separated list such as `0-1,2-3`. Endpoints are physical CUDA ordinals after `CUDA_VISIBLE_DEVICES`, not host GPU indices or virtual ggml IDs. Verify the intended UUID/topology mapping before selecting pairs; startup diagnostics show UUIDs and PCI identities. Pairs are symmetric, duplicate/reversed entries normalize, and excluded distinct-device transfers use the existing explicit host fallback. VMM access is restricted to the owner and selected readers even in an NCCL build.
+
+The selector conflicts with any presence of `GGML_CUDA_P2P` and `GGML_CUDA_ENABLE_UNIFIED_MEMORY`. Empty/malformed/self/out-of-range or unsupported pairs fail initialization. Peer-copy-disabled builds and HIP/MUSA do not support this opt-in. Actual CUDA collective initialization is rejected in selective mode, so v1 does not enable tensor-parallel NCCL/internal/meta transport. Leaving the new key absent keeps legacy behavior. Start a fresh child after changing it; host fallback performance and end-to-end inference speed require measurement. See [the selective transport contract](cuda-p2p-allowlist/DESIGN.md) and [native results](cuda-p2p-allowlist/NATIVE-RESULTS.md).
+
 ### Performance Tuning
 
 The following compilation options are also available to tweak performance:

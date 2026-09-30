@@ -1,6 +1,6 @@
 # Design: physical-pair allowlist with explicit host fallback
 
-This is the proposed implementation contract for [issue #3](https://github.com/novkien/llama.cpp-fork/issues/3), not a description of an existing option. Source and primary-document references are indexed in [RESEARCH.md](RESEARCH.md).
+This is the implemented v1 contract for [issue #3](https://github.com/novkien/llama.cpp-fork/issues/3). Bounded native evidence is in [NATIVE-RESULTS.md](NATIVE-RESULTS.md); remaining model acceptance follows the issue. Source and primary-document references are indexed in [RESEARCH.md](RESEARCH.md).
 
 ## 1. Problem and non-goals
 
@@ -13,15 +13,15 @@ The pair selector operates in the CUDA backend. It does not belong in the HTTP r
 There are two different paths in the reviewed source:
 
 1. Legacy P2P environment absent: CUDA copy callbacks still call `cudaMemcpyPeerAsync` when compiled in. Explicit peer enablement is absent, but the runtime selects the transport. The recorded peer-off experiment was correct; that does not prove every allocation type follows an identical route.
-2. Proposed excluded pair: both CUDA callbacks decline before enqueueing work. The existing generic backend uses host storage and source get/destination set. CUDA buffer get/set use D2H/H2D and synchronize their streams.
+2. Selective excluded pair: both CUDA callbacks decline before enqueueing work. The existing generic backend uses host storage and source get/destination set. CUDA buffer get/set use D2H/H2D and synchronize their streams.
 
-The proposal deliberately chooses path 2 for excluded pairs. It preserves a correct fallback algorithm, not necessarily the exact latency, buffering, or overlap of path 1. Do not advertise identical performance or infer that every `cudaMemcpyPeerAsync` call itself proves physical P2P was active.
+The implementation chooses path 2 for excluded pairs. It preserves the fallback algorithm; its latency, buffering and overlap can differ from path 1. Do not advertise identical performance or infer that every `cudaMemcpyPeerAsync` call itself proves physical P2P was active.
 
 Layer split determines where weights and compute reside. The selector controls transfers between the resulting backend buffers; it must not change layer placement. A transfer can also connect nonadjacent GPUs, especially with draft/target graphs or outputs. Apply policy to actual endpoints, not layer numbers or adjacency.
 
 ## 3. Configuration and identity
 
-Proposed environment variable:
+Environment variable:
 
 ```text
 GGML_CUDA_P2P_PAIRS=0-1,2-3
@@ -46,13 +46,13 @@ There are four allowed and eight denied ordered distinct-device edges.
 
 ### Grammar
 
-Parse a nonempty comma-separated list of decimal `a-b` pairs, allowing ASCII whitespace around tokens/separators. Accept decimal leading zeros and normalize them. Reject signs, overflow, self-pairs, empty entries, incomplete pairs, trailing garbage, and out-of-range endpoints. Validate everything before the first enable call. This resolves the earlier plan's optional wording about leading zeros into one testable proposed behavior.
+Parse a nonempty comma-separated list of decimal `a-b` pairs, allowing ASCII whitespace around tokens/separators. Accept decimal leading zeros and normalize them. Reject signs, overflow, self-pairs, empty entries, incomplete pairs, trailing garbage, and out-of-range endpoints. Validate everything before the first enable call.
 
 An explicitly requested unsupported direction is an initialization error, not permission to enable a larger set. Check capability in both directions. Capability is necessary but not proof of a correct link.
 
 ### Compatibility decisions
 
-| Setting | Proposed result |
+| Setting | Result |
 |---|---|
 | New key absent | Keep legacy behavior unchanged. |
 | New key present and valid | Activate immutable restrictive policy. |
@@ -104,4 +104,4 @@ The source initializes communicators through a separate communication context; a
 
 Start with existing blocking host fallback. Only profile-driven work should add a bounded reusable staging pool, and it must respect `NO_PINNED`. Buffer reuse after D2H but before H2D completion is forbidden; cancellation does not cancel already queued CUDA operations. Keep bytes unchanged and avoid new precision conversions.
 
-Correctness, selected transport, and workload speed are separate outcomes. Existing NVLink bandwidth does not forecast Qwen tokens/s. Native four-GPU evidence is required to promote the feature; the local software-double experiment only establishes branch feasibility. See [PREFLIGHT.md](PREFLIGHT.md) and [TESTING.md](TESTING.md).
+Correctness, selected transport, and workload speed are separate outcomes. Existing NVLink bandwidth does not forecast Qwen tokens/s. The recorded native four-GPU tests establish the bounded transport and scheduler behavior. Production promotion also requires the model acceptance in TESTING; the historical software-double experiment alone establishes only branch feasibility. See [PREFLIGHT.md](PREFLIGHT.md) and [TESTING.md](TESTING.md).

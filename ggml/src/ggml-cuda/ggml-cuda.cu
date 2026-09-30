@@ -218,6 +218,60 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+struct ggml_cuda_p2p_pair_policy {
+    bool selective = false;
+    bool allowed[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+};
+
+static ggml_cuda_p2p_pair_policy ggml_cuda_p2p_pairs;
+
+static bool ggml_cuda_p2p_space(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static ggml_cuda_p2p_pair_policy ggml_cuda_p2p_parse_pairs(const char * text, int device_count) {
+    ggml_cuda_p2p_pair_policy policy;
+    policy.selective = true;
+    const char * p = text;
+    auto skip_space = [&]() { while (ggml_cuda_p2p_space(*p)) ++p; };
+    auto parse_device = [&]() {
+        if (*p < '0' || *p > '9') GGML_ABORT("GGML_CUDA_P2P_PAIRS: expected a decimal device index");
+        const char * first = p;
+        while (*p >= '0' && *p <= '9') ++p;
+        int value = -1;
+        const auto result = std::from_chars(first, p, value);
+        if (result.ec != std::errc{} || value >= device_count) GGML_ABORT("GGML_CUDA_P2P_PAIRS: device index out of range");
+        return value;
+    };
+    skip_space();
+    if (*p == '\0') GGML_ABORT("GGML_CUDA_P2P_PAIRS: pair list is empty");
+    while (true) {
+        const int a = parse_device();
+        skip_space();
+        if (*p++ != '-') GGML_ABORT("GGML_CUDA_P2P_PAIRS: expected a-b pair");
+        skip_space();
+        const int b = parse_device();
+        if (a == b) GGML_ABORT("GGML_CUDA_P2P_PAIRS: a device cannot pair with itself");
+        policy.allowed[a][b] = true;
+        policy.allowed[b][a] = true;
+        skip_space();
+        if (*p == '\0') break;
+        if (*p++ != ',') GGML_ABORT("GGML_CUDA_P2P_PAIRS: expected a comma between pairs");
+        skip_space();
+        if (*p == '\0') GGML_ABORT("GGML_CUDA_P2P_PAIRS: trailing comma");
+    }
+    return policy;
+}
+
+static bool ggml_cuda_p2p_pair_allowed(int src_physical, int dst_physical) {
+    return !ggml_cuda_p2p_pairs.selective || ggml_cuda_p2p_pairs.allowed[src_physical][dst_physical];
+}
+
+static bool ggml_cuda_p2p_selective() {
+    (void) ggml_cuda_info();
+    return ggml_cuda_p2p_pairs.selective;
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -383,7 +437,55 @@ static ggml_cuda_device_info ggml_cuda_init() {
     // configure logging to stdout
     // CUBLAS_CHECK(cublasLoggerConfigure(1, 1, 0, nullptr));
 
-    if (getenv("GGML_CUDA_P2P") != nullptr) {
+    const char * pairs_env = getenv("GGML_CUDA_P2P_PAIRS");
+    if (pairs_env != nullptr) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+        GGML_ABORT("GGML_CUDA_P2P_PAIRS is supported only by the NVIDIA CUDA backend");
+#else
+        if (getenv("GGML_CUDA_P2P") != nullptr) GGML_ABORT("GGML_CUDA_P2P_PAIRS conflicts with GGML_CUDA_P2P");
+        if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) GGML_ABORT("GGML_CUDA_P2P_PAIRS does not support unified memory");
+#ifdef GGML_CUDA_NO_PEER_COPY
+        GGML_ABORT("GGML_CUDA_P2P_PAIRS requires peer-copy build support");
+#endif
+        const ggml_cuda_p2p_pair_policy requested = ggml_cuda_p2p_parse_pairs(pairs_env, info.physical_device_count);
+        for (int id = 0; id < info.physical_device_count; ++id) {
+            for (int other = 0; other < info.physical_device_count; ++other) {
+                if (!requested.allowed[id][other]) continue;
+                int can_access = 0;
+                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, id, other));
+                if (!can_access) GGML_ABORT("GGML_CUDA_P2P_PAIRS: CUDA device %d cannot access device %d", id, other);
+            }
+        }
+        int previous_device = 0;
+        CUDA_CHECK(cudaGetDevice(&previous_device));
+        for (int id = 0; id < info.physical_device_count; ++id) {
+            CUDA_CHECK(cudaSetDevice(id));
+            for (int other = 0; other < info.physical_device_count; ++other) {
+                if (!requested.allowed[id][other]) continue;
+                const cudaError_t enable_result = cudaDeviceEnablePeerAccess(other, 0);
+                if (enable_result == cudaErrorPeerAccessAlreadyEnabled) {
+                    (void) cudaGetLastError();
+                } else if (enable_result != cudaSuccess) {
+                    GGML_ABORT("GGML_CUDA_P2P_PAIRS: enabling %d->%d failed: %s", id, other, cudaGetErrorString(enable_result));
+                }
+            }
+        }
+        CUDA_CHECK(cudaSetDevice(previous_device));
+        ggml_cuda_p2p_pairs = requested;
+        for (int id = 0; id < info.physical_device_count; ++id) {
+            cudaDeviceProp prop;
+            CUDA_CHECK(cudaGetDeviceProperties(&prop, id));
+            char uuid[37];
+            const unsigned char * b = reinterpret_cast<const unsigned char *>(prop.uuid.bytes);
+            snprintf(uuid, sizeof(uuid), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+                b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7],b[8],b[9],b[10],b[11],b[12],b[13],b[14],b[15]);
+            GGML_LOG_INFO("GGML_CUDA_P2P_PAIRS: CUDA%d GPU-%s PCI %04x:%02x:%02x\n", id, uuid, prop.pciDomainID, prop.pciBusID, prop.pciDeviceID);
+        }
+        for (int a = 0; a < info.physical_device_count; ++a) for (int b = a + 1; b < info.physical_device_count; ++b) {
+            if (requested.allowed[a][b]) GGML_LOG_INFO("GGML_CUDA_P2P_PAIRS: enabled %d-%d\n", a, b);
+        }
+#endif
+    } else if (getenv("GGML_CUDA_P2P") != nullptr) {
         for (int id = 0; id < info.physical_device_count; ++id) {
             CUDA_CHECK(cudaSetDevice(id));
             for (int id_other = 0; id_other < info.physical_device_count; ++id_other) {
@@ -602,6 +704,8 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if defined(GGML_USE_NCCL)
             use_peer_access = true;
 #endif // defined(GGML_USE_NCCL)
+            const bool selective = ggml_cuda_p2p_selective();
+            use_peer_access = use_peer_access || selective;
 
             if (use_peer_access) {
                 // NCCL implicitly enables peer access (cudaDeviceEnablePeerAccess), and
@@ -612,10 +716,14 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 // virtual devices can map to the same physical GPU).
                 std::vector<CUmemAccessDesc> access_descs;
                 bool physical_seen[GGML_CUDA_MAX_DEVICES] = {};
-                const int device_count = ggml_cuda_info().device_count;
+                const ggml_cuda_device_info & info = ggml_cuda_info();
+                const int device_count = selective ? info.physical_device_count : info.device_count;
                 for (int id = 0; id < device_count; ++id) {
-                    const int id_physical = ggml_cuda_get_physical_device(id);
+                    const int id_physical = selective ? id : ggml_cuda_get_physical_device(id);
                     if (id_physical != physical_device) {
+                        if (selective && !ggml_cuda_p2p_pair_allowed(id_physical, physical_device)) {
+                            continue;
+                        }
                         int can_access_peer = 0;
                         CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
                         if (!can_access_peer) {
@@ -823,6 +931,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
+            if (!ggml_cuda_p2p_pair_allowed(src_physical, dst_physical)) return false;
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
@@ -1209,6 +1318,7 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
             return nullptr;
         }
     }
+    if (ggml_cuda_p2p_selective()) GGML_ABORT("GGML_CUDA_P2P_PAIRS does not support CUDA collective initialization");
 
     auto * ret = new ggml_backend_cuda_comm_context;
     ret->backends.assign(backends, backends + n_backends);
@@ -2514,6 +2624,7 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
+            if (!ggml_cuda_p2p_pair_allowed(src_physical, dst_physical)) return false;
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else

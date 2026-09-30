@@ -1,6 +1,6 @@
 # Candidate regression and acceptance plan
 
-These are requirements for future implementation. The docs-only PR satisfies documentation delivery, not the unchecked runtime requirements below. The pre-code test and actual local results are in [PREFLIGHT.md](PREFLIGHT.md) and [PREFLIGHT-RESULTS.md](PREFLIGHT-RESULTS.md).
+The v1 implementation has the bounded native evidence in [NATIVE-RESULTS.md](NATIVE-RESULTS.md). This matrix also covers remaining platform/failure/model scenarios; unexecuted rows are not inferred to pass. Historical pre-code evidence remains in [PREFLIGHT.md](PREFLIGHT.md) and [PREFLIGHT-RESULTS.md](PREFLIGHT-RESULTS.md).
 
 ## 1. Evidence must identify the candidate
 
@@ -64,13 +64,15 @@ Use fresh children for baseline -> selective -> rollback. Do not add the already
 
 Record individual outputs/token IDs when available, finish reasons, draft generated/accepted counts, target verification work, native decode and prompt throughput, TTFT, client elapsed, copy counts/bytes/time, host-memory usage, clocks/temperature/competing load, errors, cancellation, and cleanup. Report all repeats and their median/range rather than one selected run.
 
+The route may have newer owner-selected speculative settings than this historical MTP fixture. Preserve the actual deployed route for its own baseline/selective/rollback test, and label any separate historical-MTP trial explicitly. Do not compare different speculative methods as a transport-only A/B.
+
 The historical healthy reference is approximately 44-45 decode tokens/s and 159/285 accepted draft tokens for the recorded request. These are context-specific observations, not universal required counts. Use a fresh healthy same-binary baseline. Establish baseline variability before interpreting a difference. Raw-copy mismatches always fail; large unexplained output/draft divergence is not dismissed as normal nondeterminism.
 
 A transfer bandwidth gain need not improve token generation if those copies occupy little runtime or the explicit host fallback adds more cost. Report correctness, selected transport, and performance separately. Native correct routing with unresolved performance gain remains PARTIAL for production promotion.
 
 ## 6. Publication and rollback
 
-A documentation PR or implementation merge does not close the issue. No production action is included in the current draft. When native execution is authorized, use existing managed drain/unload/reload controls rather than killing a busy bridge child. Preserve other routes and rollback to the verified healthy binary/environment. Remove new/old P2P keys as required; setting the old key to `0` is not disabling it.
+A documentation PR or implementation merge does not close the issue. The owner has now authorized task-scoped build/deployment and model acceptance; record the exact delivered revisions and results in the issue. When native execution is authorized, use existing managed drain/unload/reload controls rather than killing a busy bridge child. Preserve other routes and rollback to the verified healthy binary/environment. Remove new/old P2P keys as required; setting the old key to `0` is not disabling it.
 
 The companion proxy/bridge change needs matching validation and launch-hash tests. Verify the effective child, not only route JSON. An old binary ignoring the new key cannot pass activation.
 

@@ -1,6 +1,6 @@
 # Implementation map and engineering notes
 
-No code below is an implemented patch. This is the work map for the future coder, based on `526c43b8f7dfea9032e9f35e7a1be9183ca7cc20`. Read the current source before using these symbol names. The feature contract is in [DESIGN.md](DESIGN.md); sources are in [RESEARCH.md](RESEARCH.md).
+The v1 backend now implements the pair parser/policy, filtered initialization and VMM descriptors, both copy gates, and the collective rejection boundary in `ggml-cuda.cu`. [NATIVE-RESULTS.md](NATIVE-RESULTS.md) records its bounded native validation. The baseline change map below was prepared from `526c43b8f7dfea9032e9f35e7a1be9183ca7cc20`; recheck current source before modifying these paths. The feature contract is in [DESIGN.md](DESIGN.md); sources are in [RESEARCH.md](RESEARCH.md).
 
 ## 1. Trace the whole layer handoff
 
@@ -27,7 +27,7 @@ In `ggml/src/ggml-backend.cpp`, the scheduler calls the backend interface direct
 
 All CUDA symbols in this table are in `ggml/src/ggml-cuda/ggml-cuda.cu` unless stated otherwise.
 
-| Target | Existing behavior | Required future work | Primary failure risk |
+| Target | Reviewed baseline behavior | Implementation/review requirement | Primary failure risk |
 |---|---|---|---|
 | `ggml_cuda_init` | Presence of old flag enables all capable ordered physical pairs. | Parse/validate once; enable exactly the selected directions; publish immutable state. | Partial policy, accidentally enabled PCIe edge, recursive static initialization. |
 | `ggml_cuda_get_physical_device` / `ggml_cuda_info` | Map logical backend IDs to runtime physical IDs. | Reuse after initialization; use local `info` during initialization. | Mixing host, runtime, virtual, and route-list indices. |
@@ -107,8 +107,8 @@ Returning false after allocating/enqueueing half of a staged copy risks duplicat
 
 ## 8. Managed-route dependency
 
-The reviewed proxy and bridge allow `GGML_CUDA_P2P` but not the proposed pair key. Before managed acceptance, a companion change must add the new key and matching bounded grammar/conflict checks to `src/llama_proxy/launcher_spec.py` and `bridge/server.py`, with tests in `tests/test_launcher_spec.py` and `tests/test_bridge_ports.py`. Recheck their current branch and instructions before that separate repository work.
+The original proxy and bridge did not allow the pair key. Companion [llama-proxy PR #484](https://github.com/novkien/llama-proxy/pull/484) adds the key and matching bounded grammar/conflict checks to `src/llama_proxy/launcher_spec.py` and `bridge/server.py`, with tests in `tests/test_launcher_spec.py` and `tests/test_bridge_ports.py`. It merged as `e1b21f86e1794e5e1ce2688eb8449999412e6657`; managed acceptance must verify that code is active on both services.
 
 Keep the child authoritative for its actual CUDA count/capability. Preserve full UUID visibility, split/MTP/RPC arguments, `NO_PINNED`, envelope hashing, and revision-checked configuration writes. Check the effective inherited child environment for an old/new conflict. Route readback alone does not prove the binary recognizes the option; require its policy diagnostic and the intended binary identity.
 
-This docs PR makes none of those changes. It records the dependency so a CLI-only demonstration cannot be mistaken for end-to-end delivery.
+The companion launcher delivery is tracked in [llama-proxy #470](https://github.com/novkien/llama-proxy/issues/470). Verify its actual activation and route/child readback before claiming managed acceptance; CLI-only native tests do not establish that delivery.

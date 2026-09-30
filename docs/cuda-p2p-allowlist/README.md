@@ -1,42 +1,29 @@
-# Selective CUDA P2P: coder preparation pack
+# Selective CUDA peer transport
 
-Status: documentation-only draft. No backend feature, executable test, build configuration, workflow, launcher, or production change is included in this PR.
+Status: the opt-in CUDA backend is implemented and has passed the bounded native four-V100 tests in [NATIVE-RESULTS.md](NATIVE-RESULTS.md). Managed model acceptance and deployment evidence are tracked in [issue #3](https://github.com/novkien/llama.cpp-fork/issues/3).
 
-Tracks [llama.cpp-fork #3](https://github.com/novkien/llama.cpp-fork/issues/3). The starting design is the [owner-requested implementation plan](https://github.com/novkien/llama.cpp-fork/issues/3#issuecomment-5904416014). These documents organize that plan for implementation and add an explicitly limited pre-implementation experiment. They do not mark the proposal approved or the feature deployed.
+## Behavior
 
-## Intended outcome
+`GGML_CUDA_P2P_PAIRS=0-1,2-3` enables both directions of the two configured physical CUDA pairs. Endpoints use the runtime order after `CUDA_VISIBLE_DEVICES`; startup logs show each full UUID and PCI identity. Every excluded distinct-device edge declines both CUDA copy callbacks and reaches the existing explicit host get/set fallback. Local copies and virtual aliases keep D2D behavior. The VMM pool grants its owner and only permitted physical readers, including in an NCCL build.
 
-Keep all four GPUs in layer-split inference. With the verified process mapping, allow peer transfers only between CUDA0/CUDA1 and CUDA2/CUDA3. Every other distinct local CUDA pair must take an explicit host-memory fallback. Preserve the model, layer distribution, MTP draft placement, context, parallelism, and RPC configuration from the issue.
+For the verified four-V100 UUID order `5ca3,b2e,e149,d4d`, the forward and reverse layer handoffs are `PEER, HOST, PEER`. Resolve full current UUIDs and topology before configuring another process. Capability alone does not establish a correct peer link.
 
-```text
-Target layer groups: CUDA0 -> CUDA1 -> CUDA2 -> CUDA3
-Transfer choice:       PEER     HOST     PEER
-Reverse transfers:     PEER     HOST     PEER
-```
+The old global `GGML_CUDA_P2P` key conflicts with the pair selector even when its value is `0` or empty. Empty/malformed lists, self-pairs, out-of-range/unsupported directions, managed-memory mode and peer-copy-disabled builds fail initialization. Selective collective initialization is unsupported in v1 and fails before NCCL/internal/meta transport setup. HIP/MUSA attempted opt-in is unsupported. With the new key absent, legacy behavior is retained. Configuration changes require a fresh process.
 
-The proposed `GGML_CUDA_P2P_PAIRS=0-1,2-3` option does not exist in the reviewed backend. Merely setting it on that binary proves nothing.
+## Evidence and maintenance
 
-## Read in this order
-
-| Document | What the coder gets |
+| Document | Purpose |
 |---|---|
-| [DESIGN.md](DESIGN.md) | Exact policy contract, identity mapping, normal-path clarification, supported scope, and invariants. |
-| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Symbol-level change map, source flow, sensitive code, implementation sequence, and integration dependency. |
-| [RESEARCH.md](RESEARCH.md) | Primary-source CUDA/NCCL knowledge and what each source does and does not establish. |
-| [PREFLIGHT.md](PREFLIGHT.md) | Experiments to falsify the design before feature implementation, including a native four-GPU seam test. |
-| [PREFLIGHT-RESULTS.md](PREFLIGHT-RESULTS.md) | Actual local experiment, transcript, negative controls, and limits. |
-| [TESTING.md](TESTING.md) | Candidate regression matrix, real layer-graph validation, Qwen acceptance, and completion checklist. |
+| [DESIGN.md](DESIGN.md) | Physical identity, grammar, VMM/copy invariants and supported scope. |
+| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Reviewed source paths, synchronization boundaries and managed-launch dependency. |
+| [RESEARCH.md](RESEARCH.md) | Primary-source context and limits of the transport claims. |
+| [PREFLIGHT.md](PREFLIGHT.md) | Experiments A/B/C and their different evidence levels. |
+| [PREFLIGHT-RESULTS.md](PREFLIGHT-RESULTS.md) | Historical host-only experiment and negative controls. |
+| [NATIVE-RESULTS.md](NATIVE-RESULTS.md) | Actual hardware, whole-scheduler, callback, pool and bandwidth results. |
+| [TESTING.md](TESTING.md) | Regression matrix and separate four-GPU model acceptance. |
 
-## Current evidence
+The initial source-branch experiment established only dispatch feasibility. Native testing subsequently exercised all 12 directed edges, offset views and physical aliases, the actual VMM pool, and a whole four-stage scheduler graph with the candidate's unmodified callbacks. The measured explicit pageable-host path is slower than the selected NVLink paths; copy bandwidth does not forecast Qwen token throughput.
 
-The accessible default branch was rechecked at `526c43b8f7dfea9032e9f35e7a1be9183ca7cc20` on 2026-09-30. This is a source baseline, not the installed host binary. The issue's older `2138591d...` reference previously failed to resolve; do not treat it as a usable implementation base without checking it.
+The first implementation uses the existing blocking fallback. It adds no staging pool, model/layer-placement change, RPC transport change, precision conversion or NVML runtime dependency. A companion launcher change permits the new key at the proxy and bridge; effective child environment, binary identity and policy logs remain part of managed acceptance.
 
-A disposable host-only C++ probe executed five copied source function bodies and two scheduler copy blocks with software test doubles. It passed 1,874 positive scenario combinations and detected the intended incomplete-gate negative controls. It did not compile the whole scheduler, execute a CUDA API, or run a model. Native feasibility remains PARTIAL because this environment has no CUDA driver/device. See the results document before quoting any number.
-
-## Working boundary
-
-Continue development on this draft's branch when implementation is requested. Read the current checkout's applicable instructions and reconcile newer changes before editing. Do not overwrite another coder's work or rewrite a shared branch to match this dated baseline.
-
-Only Markdown files in this folder are introduced. The temporary local probe is evidence gathering, not a shipped implementation. No merge, production restart, BIOS/IOMMU/ACS change, or automatic issue closure is authorized by this docs PR. Link the issue with `Refs #3`, not a closing keyword.
-
-The first implementation can stay small: one policy, filtered peer initialization, filtered VMM access, both copy callbacks gated, and existing host fallback. A new asynchronous staging subsystem is not a prerequisite unless measured performance requires it.
+The current owner request also delivers PR #2's RAM-cache repair. Optional SSD spill is not implemented. Neither a merge nor successful model loading substitutes for the applicable runtime checks in the issues. Preserve concurrent changes and the exact reviewed candidate during task-scoped publication and deployment.
