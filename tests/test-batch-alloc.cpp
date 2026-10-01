@@ -4,7 +4,9 @@
 
 #include "../src/llama-batch.h"
 #include "../src/llama-arch.h"
+#include "../src/llama-ext.h"
 #include "../src/llama-hparams.h"
+#include "../src/llama-model.h"
 #include "../src/llama-memory.h"
 #include "../src/llama-vocab.h"
 
@@ -14,6 +16,20 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+struct model_stub : llama_model {
+    explicit model_stub(llm_arch arch) : llama_model(llama_model_default_params()) {
+        this->arch = arch;
+    }
+
+    void load_stats(llama_model_loader &) override {}
+    void load_hparams(llama_model_loader &) override {}
+    void load_vocab(llama_model_loader &) override {}
+    bool load_tensors(llama_model_loader &) override { return true; }
+    void load_arch_hparams(llama_model_loader &) override {}
+    void load_arch_tensors(llama_model_loader &) override {}
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params &) const override { return nullptr; }
+};
 
 // mock memory that only provides per-sequence position ranges
 struct mock_memory : public llama_memory_i {
@@ -791,6 +807,120 @@ static void test_mrope(testing & t) {
         t.assert_true("gap after memory is allowed",     try_pos(15));
         t.assert_true("overlap is allowed for embd",     try_pos(9));
         t.assert_true("pos behind memory is rejected",  !try_pos(8));
+    });
+
+    t.test("legacy_dflash_mrope_inference", [&](testing & t) {
+        model_stub target(LLM_ARCH_QWEN35);
+        target.hparams.n_layer_all = 1;
+        target.hparams.n_rot_full = 64;
+        target.hparams.rope_sections = { 11, 11, 10, 0 };
+
+        model_stub draft(LLM_ARCH_DFLASH);
+        draft.hparams.n_layer_all = 1;
+        draft.hparams.n_rot_full = 64;
+        draft.hparams.n_embd_head_k_full = 64;
+
+        t.assert_equal("legacy DFlash paired with IM-RoPE target is adapted",
+                1, llama_model_set_dflash_mrope_from_target(&draft, &target));
+        t.assert_equal("temporal section uses all rotary pairs", 32, draft.hparams.rope_sections[0]);
+        t.assert_equal(0, draft.hparams.rope_sections[1]);
+        t.assert_equal(LLAMA_ROPE_TYPE_MROPE, draft.hparams.rope_type);
+
+        model_stub target_mrope(LLM_ARCH_QWEN2VL);
+        target_mrope.hparams.n_layer_all = 1;
+        target_mrope.hparams.n_rot_full = 64;
+        target_mrope.hparams.rope_sections = { 16, 16, 0, 0 };
+        model_stub draft_mrope(LLM_ARCH_DFLASH);
+        draft_mrope.hparams.n_layer_all = 1;
+        draft_mrope.hparams.n_rot_full = 64;
+        draft_mrope.hparams.n_embd_head_k_full = 64;
+        t.assert_equal("legacy DFlash paired with M-RoPE target is adapted", 1,
+                llama_model_set_dflash_mrope_from_target(&draft_mrope, &target_mrope));
+    });
+
+    t.test("legacy_dflash_mrope_inference_guards", [&](testing & t) {
+        model_stub target(LLM_ARCH_QWEN35);
+        target.hparams.n_layer_all = 1;
+        target.hparams.n_rot_full = 64;
+        target.hparams.rope_sections = { 11, 11, 10, 0 };
+
+        t.assert_equal("null draft is ignored", 0,
+                llama_model_set_dflash_mrope_from_target(nullptr, &target));
+
+        model_stub draft_null_target(LLM_ARCH_DFLASH);
+        t.assert_equal("null target is ignored", 0,
+                llama_model_set_dflash_mrope_from_target(&draft_null_target, nullptr));
+
+        model_stub draft_explicit(LLM_ARCH_DFLASH);
+        draft_explicit.hparams.n_layer_all = 1;
+        draft_explicit.hparams.n_rot_full = 64;
+        draft_explicit.hparams.n_embd_head_k_full = 64;
+        draft_explicit.hparams.rope_sections = { 32, 0, 0, 0 };
+        t.assert_equal("explicit draft sections are preserved", 0,
+                llama_model_set_dflash_mrope_from_target(&draft_explicit, &target));
+        t.assert_equal(32, draft_explicit.hparams.rope_sections[0]);
+
+        model_stub draft_dsv4(LLM_ARCH_DFLASH);
+        draft_dsv4.hparams.n_layer_all = 1;
+        draft_dsv4.hparams.dsv4_hc_mult = 1;
+        t.assert_equal("DSV4 DFlash is not adapted", 0,
+                llama_model_set_dflash_mrope_from_target(&draft_dsv4, &target));
+
+        model_stub draft_other(LLM_ARCH_LLAMA);
+        t.assert_equal("non-DFlash draft is not adapted", 0,
+                llama_model_set_dflash_mrope_from_target(&draft_other, &target));
+
+        model_stub target_text(LLM_ARCH_LLAMA);
+        target_text.hparams.rope_sections = { 11, 11, 10, 0 };
+        model_stub draft_text(LLM_ARCH_DFLASH);
+        draft_text.hparams.n_layer_all = 1;
+        draft_text.hparams.n_rot_full = 64;
+        draft_text.hparams.n_embd_head_k_full = 64;
+        t.assert_equal("text-only target is not adapted", 0,
+                llama_model_set_dflash_mrope_from_target(&draft_text, &target_text));
+
+        model_stub target_without_sections(LLM_ARCH_QWEN35);
+        model_stub draft_without_sections(LLM_ARCH_DFLASH);
+        draft_without_sections.hparams.n_layer_all = 1;
+        draft_without_sections.hparams.n_rot_full = 64;
+        draft_without_sections.hparams.n_embd_head_k_full = 64;
+        t.assert_equal("target without section metadata is not adapted", 0,
+                llama_model_set_dflash_mrope_from_target(&draft_without_sections, &target_without_sections));
+
+        model_stub draft_invalid(LLM_ARCH_DFLASH);
+        draft_invalid.hparams.n_layer_all = 1;
+        draft_invalid.hparams.n_embd_head_k_full = 64;
+        draft_invalid.hparams.n_rot_full = 0;
+        t.assert_equal("zero rotary dimension is rejected", -1,
+                llama_model_set_dflash_mrope_from_target(&draft_invalid, &target));
+
+        draft_invalid.hparams.n_rot_full = 63;
+        t.assert_equal("odd rotary dimension is rejected", -1,
+                llama_model_set_dflash_mrope_from_target(&draft_invalid, &target));
+
+        draft_invalid.hparams.n_rot_full = 66;
+        t.assert_equal("rotary dimension larger than head is rejected", -1,
+                llama_model_set_dflash_mrope_from_target(&draft_invalid, &target));
+    });
+
+    t.test("token_pos_jump_after_media", [&](testing & t) {
+        mock_memory mem;
+        mem.ranges[0] = { 0, 15 };
+
+        auto accepts_position = [&](uint32_t n_pos_per_embd) {
+            batch_builder bb(2, &mem, 4, n_pos_per_embd, 16);
+            const int32_t idx = bb.b.add_token(0);
+            const llama_pos pos = 48;
+            bb.b.set_token_id(idx, 1);
+            bb.b.set_token_pos(idx, &pos);
+            bb.b.set_output(idx, true);
+
+            llama_batch_allocr ba(n_pos_per_embd);
+            return ba.init(bb.b, vocab, false);
+        };
+
+        t.assert_true("one-position draft rejects a skipped media range", !accepts_position(1));
+        t.assert_true("M-RoPE draft accepts text after skipped media positions", accepts_position(4));
     });
 }
 

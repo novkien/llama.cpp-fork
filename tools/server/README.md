@@ -21,6 +21,23 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
 
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
 
+## Fork scheduling
+
+This fork separates prompt processing (PP) and token generation (TG) into phases.
+Compatible requests share prompt batch capacity during PP. Requests may join the
+current group until its first member finishes PP; at that point membership closes.
+Completed prompts wait with an owned copy of their final logits until every member
+has finished PP or been cancelled. First-token sampling and speculative generation
+start only after that barrier opens.
+
+The group then generates until all its members finish or are cancelled. Requests
+arriving after membership closes wait for the next PP phase, including requests
+assigned to a free slot while the current group is generating. This applies to
+streaming and non-streaming completions. There is no elapsed-time bypass of the
+barrier. As a result, a short prompt may wait for a longer member, and a new request
+may wait for the current group's longest response. Batch and slot limits still
+control capacity; the scheduler does not increase either limit.
+
 ## Usage
 
 <!-- HELP_START -->

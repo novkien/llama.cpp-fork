@@ -3155,6 +3155,36 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
     return LLAMA_ROPE_TYPE_NONE;
 }
 
+int32_t llama_model_set_dflash_mrope_from_target(llama_model * draft, const llama_model * target) {
+    if (!draft || !target || draft->arch != LLM_ARCH_DFLASH || draft->hparams.dsv4_hc_mult > 0) {
+        return 0;
+    }
+
+    const auto target_rope_type = llama_model_rope_type(target);
+    if ((target_rope_type != LLAMA_ROPE_TYPE_MROPE && target_rope_type != LLAMA_ROPE_TYPE_IMROPE) ||
+            std::none_of(target->hparams.rope_sections.begin(), target->hparams.rope_sections.end(),
+                    [](int section) { return section > 0; })) {
+        return 0;
+    }
+
+    auto & sections = draft->hparams.rope_sections;
+    if (std::any_of(sections.begin(), sections.end(), [](int section) { return section != 0; })) {
+        return 0;
+    }
+
+    const uint32_t n_rot = draft->hparams.n_rot();
+    if (n_rot == 0 || n_rot % 2 != 0 || n_rot > draft->hparams.n_embd_head_k()) {
+        LLAMA_LOG_ERROR("%s: cannot infer temporal-only M-RoPE for DFlash draft with invalid rotary dimension %u\n",
+                __func__, n_rot);
+        return -1;
+    }
+
+    sections = { (int) (n_rot / 2), 0, 0, 0 };
+    draft->hparams.rope_type = llama_model_rope_type(draft);
+
+    return draft->hparams.rope_type == LLAMA_ROPE_TYPE_MROPE ? 1 : -1;
+}
+
 float llama_model_rope_freq_scale_train(const llama_model * model) {
     return model->hparams.rope_freq_scale_train;
 }

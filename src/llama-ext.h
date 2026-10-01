@@ -86,6 +86,12 @@ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory
 LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
+// Apply temporal-only M-RoPE to a legacy DFlash draft paired with a multimodal RoPE target.
+// Returns 1 if updated, 0 if not applicable, or -1 if the draft dimensions are invalid.
+LLAMA_API int32_t llama_model_set_dflash_mrope_from_target(
+        struct llama_model * draft,
+        const struct llama_model * target);
+
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);

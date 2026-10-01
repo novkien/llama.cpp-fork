@@ -106,6 +106,12 @@ enum slot_state {
     SLOT_STATE_GENERATING,
 };
 
+enum server_scheduler_phase {
+    SERVER_SCHEDULER_PHASE_IDLE,
+    SERVER_SCHEDULER_PHASE_PREFILL,
+    SERVER_SCHEDULER_PHASE_GENERATE,
+};
+
 struct server_slot; // forward declaration
 
 struct server_batch {
@@ -196,7 +202,7 @@ struct server_batch {
 };
 
 struct server_slot {
-    int id;
+    int id = -1;
 
     llama_context * ctx_tgt = nullptr;
     llama_context * ctx_dft = nullptr;
@@ -252,6 +258,10 @@ struct server_slot {
 
     // state
     slot_state state = SLOT_STATE_IDLE;
+    bool phase_member = false;
+    bool prompt_complete = false;
+    bool use_backend_sampler = false;
+    std::vector<float> prompt_logits;
 
     server_prompt prompt;
 
@@ -325,6 +335,10 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
+        phase_member = false;
+        prompt_complete = false;
+        use_backend_sampler = false;
+        prompt_logits.clear();
 
         llama_set_sampler(ctx_tgt, id, nullptr);
 
@@ -856,6 +870,8 @@ private:
 
     // slots / clients
     std::vector<server_slot> slots;
+    server_scheduler_phase scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+    bool scheduler_phase_sealed = false;
 
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
@@ -887,6 +903,18 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+        scheduler_phase_sealed = false;
+        for (auto & slot : slots) {
+            if (ctx_tgt && slot.id >= 0) {
+                llama_set_sampler(ctx_tgt, slot.id, nullptr);
+            }
+            slot.phase_member = false;
+            slot.prompt_complete = false;
+            slot.use_backend_sampler = false;
+            slot.prompt_logits.clear();
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1631,6 +1659,10 @@ private:
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         GGML_ASSERT(!slot.is_processing());
+        slot.phase_member = false;
+        slot.prompt_complete = false;
+        slot.prompt_logits.clear();
+        slot.use_backend_sampler = false;
         if (!task.tokens.validate(ctx_tgt)) {
             send_error(task, "Prompt contains invalid tokens", ERROR_TYPE_INVALID_REQUEST);
             return false;
@@ -1704,11 +1736,8 @@ private:
             use_backend_sampling &= !need_pre_sample_logits;
 
             // TODO: tmp until backend sampling is fully implemented
-            if (use_backend_sampling) {
-                llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
-            } else {
-                llama_set_sampler(ctx_tgt, slot.id, nullptr);
-            }
+            slot.use_backend_sampler = use_backend_sampling;
+            llama_set_sampler(ctx_tgt, slot.id, nullptr);
 
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
@@ -1769,6 +1798,8 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+        slot.phase_member = scheduler_phase == SERVER_SCHEDULER_PHASE_PREFILL &&
+            !scheduler_phase_sealed && has_active_phase_members();
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -1908,7 +1939,7 @@ private:
         return slot.has_next_token; // continue
     }
 
-    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx) const {
+    void populate_token_probs(const server_slot & slot, completion_token_output & result, bool post_sampling, bool special, int idx, const std::vector<float> * prompt_logits = nullptr) const {
         const size_t n_probs_request = slot.task->params.sampling.n_probs;
 
         if (post_sampling) {
@@ -1940,7 +1971,9 @@ private:
                 });
             }
         } else {
-            std::vector<llama_token_data> cur = get_token_probabilities(ctx_tgt, idx, n_probs_request);
+            std::vector<llama_token_data> cur = prompt_logits
+                ? get_token_probabilities(prompt_logits->data(), prompt_logits->size(), n_probs_request)
+                : get_token_probabilities(ctx_tgt, idx, n_probs_request);
             const size_t max_probs = cur.size();
             const size_t n_probs = std::min(max_probs, n_probs_request);
 
@@ -2708,6 +2741,8 @@ private:
                 slot.release();
             }
         }
+        scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+        scheduler_phase_sealed = false;
     }
 
     // @ngxson : for debugging only
@@ -2740,6 +2775,153 @@ private:
     };
 #endif
 
+    void cleanup_orphaned_children() {
+        for (auto & slot : slots) {
+            if (slot.state != SLOT_STATE_WAIT_OTHER || !slot.task) {
+                continue;
+            }
+
+            const bool parent_active = std::any_of(slots.begin(), slots.end(), [&](const server_slot & other) {
+                return other.task && other.task->id == slot.task->id_parent;
+            });
+            if (!parent_active) {
+                send_error(slot, "parent task ended before its prompt was processed", ERROR_TYPE_SERVER);
+                slot.release();
+            }
+        }
+    }
+
+    bool has_active_phase_members() const {
+        return std::any_of(slots.begin(), slots.end(), [](const server_slot & slot) {
+            return slot.phase_member && slot.is_processing();
+        });
+    }
+
+    void begin_prefill_phase() {
+        GGML_ASSERT(scheduler_phase == SERVER_SCHEDULER_PHASE_IDLE);
+
+        bool has_members = false;
+        for (auto & slot : slots) {
+            if (!slot.is_processing()) {
+                continue;
+            }
+
+            slot.phase_member = true;
+            slot.prompt_complete = false;
+            slot.prompt_logits.clear();
+            has_members = true;
+        }
+
+        if (has_members) {
+            scheduler_phase = SERVER_SCHEDULER_PHASE_PREFILL;
+            scheduler_phase_sealed = false;
+            SRV_DBG("starting prefill cohort with %zu active slots\n",
+                    (size_t) std::count_if(slots.begin(), slots.end(), [](const server_slot & slot) { return slot.phase_member; }));
+        }
+    }
+
+    void start_generation_member(server_slot & slot) {
+        GGML_ASSERT(slot.task && slot.state == SLOT_STATE_DONE_PROMPT);
+        GGML_ASSERT(slot.prompt_complete && !slot.prompt_logits.empty());
+
+        slot.state = SLOT_STATE_GENERATING;
+        slot.i_batch = -1;
+
+        if (slot.can_speculate()) {
+            common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+        }
+
+        llama_token id;
+        {
+            scoped_timer timer(t_sampl, n_sampl);
+            id = common_sampler_sample_logits(slot.smpl.get(), slot.prompt_logits.data(), slot.prompt_logits.size());
+        }
+
+        common_sampler_accept(slot.smpl.get(), id, true);
+
+        const int64_t t_now = ggml_time_us();
+        slot.stats.n_gen += 1;
+
+        if (slot.stats.n_gen == 1) {
+            slot.stats.update_prompt_last();
+            slot.t_print_last = t_now;
+            slot.n_gen_last = 0;
+        }
+
+        slot.stats.update_gen_last();
+
+        completion_token_output result;
+        result.tok          = id;
+        result.text_to_send = common_token_to_piece(slot.ctx_tgt, id,
+                params_base.special || slot.task->params.sampling.preserved_tokens.find(id) != slot.task->params.sampling.preserved_tokens.end());
+        result.prob         = 1.0f;
+
+        if (slot.task->params.sampling.n_probs > 0) {
+            populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, -1, &slot.prompt_logits);
+        }
+
+        if (!process_token(result, slot)) {
+            slot.print_timings();
+            send_final_response(slot);
+            slot.release();
+            return;
+        }
+
+        slot.prompt_logits.clear();
+        if (slot.use_backend_sampler) {
+            llama_set_sampler(ctx_tgt, slot.id, common_sampler_get(slot.smpl.get()));
+        }
+        slot.print_timings_tg();
+    }
+
+    void advance_scheduler_phase() {
+        if (scheduler_phase == SERVER_SCHEDULER_PHASE_IDLE) {
+            return;
+        }
+
+        if (scheduler_phase == SERVER_SCHEDULER_PHASE_GENERATE) {
+            if (!has_active_phase_members()) {
+                SRV_DBG("%s", "generation cohort complete\n");
+                scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+                scheduler_phase_sealed = false;
+            }
+            return;
+        }
+
+        if (!has_active_phase_members()) {
+            SRV_DBG("%s", "prefill cohort ended without an active member\n");
+            scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+            scheduler_phase_sealed = false;
+            return;
+        }
+
+        if (!scheduler_phase_sealed) {
+            return;
+        }
+
+        for (const auto & slot : slots) {
+            if (slot.phase_member && slot.is_processing() && !slot.prompt_complete) {
+                return;
+            }
+        }
+
+        scheduler_phase = SERVER_SCHEDULER_PHASE_GENERATE;
+        SRV_DBG("%s", "prefill cohort complete; starting generation\n");
+
+        for (auto & slot : slots) {
+            if (!slot.phase_member || !slot.is_processing() || !slot.task->need_sampling()) {
+                continue;
+            }
+
+            start_generation_member(slot);
+        }
+
+        if (!has_active_phase_members()) {
+            scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+            scheduler_phase_sealed = false;
+        }
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -2754,6 +2936,9 @@ private:
         }
 #endif
 
+        cleanup_orphaned_children();
+        advance_scheduler_phase();
+
         // check if all slots are idle
         {
             bool all_idle = true;
@@ -2767,6 +2952,8 @@ private:
 
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
+                scheduler_phase = SERVER_SCHEDULER_PHASE_IDLE;
+                scheduler_phase_sealed = false;
 
                 metrics_flush_idle();
 
@@ -2781,9 +2968,14 @@ private:
             }
         }
 
+        if (scheduler_phase == SERVER_SCHEDULER_PHASE_IDLE) {
+            begin_prefill_phase();
+        }
+
         try {
             scoped_timer t(t_pre_decode, n_pre_decode);
             pre_decode();
+            advance_scheduler_phase();
         } catch (const std::exception & e) {
             SRV_ERR("pre_decode() failed: %s\n", e.what());
             abort_all_slots("pre_decode() failed: " + std::string(e.what()));
@@ -2846,6 +3038,7 @@ private:
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
                 post_decode(n_tokens, off);
+                advance_scheduler_phase();
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
                 abort_all_slots("post_decode() failed: " + std::string(e.what()));
@@ -2858,7 +3051,8 @@ private:
         // apply context-shift if needed
         // TODO: simplify and improve
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+            if (scheduler_phase == SERVER_SCHEDULER_PHASE_GENERATE && slot.phase_member &&
+                    slot.state == SLOT_STATE_GENERATING && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
                 if (!params_base.ctx_shift) {
                     // this check is redundant (for good)
                     // we should never get here, because generation should already stopped in process_token()
@@ -2930,7 +3124,8 @@ private:
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
-            if (slot.state != SLOT_STATE_GENERATING) {
+            if (scheduler_phase != SERVER_SCHEDULER_PHASE_GENERATE || !slot.phase_member ||
+                    slot.state != SLOT_STATE_GENERATING) {
                 return;
             }
 
@@ -3056,15 +3251,29 @@ private:
         auto & alora_disabled_id = batch.alora_disabled_id;
 
         // next, batch any pending prompts without exceeding n_batch
-        if (params_base.cont_batching || batch.size() == 0) {
+        if (scheduler_phase == SERVER_SCHEDULER_PHASE_PREFILL && (params_base.cont_batching || batch.size() == 0)) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
+            server_slot * slot_batch_group = nullptr;
+            int32_t n_prompt_slots_remaining = 0;
+            size_t i_slot = 0;
 
             iterate(slots, [&](server_slot & slot) {
+                const size_t slot_index = i_slot++;
+
                 if (!add_ok || batch.size() >= n_batch) {
                     return; // batch is full, skip remaining slots
                 }
 
-                if (!slot.is_processing()) {
+                if (!slot.is_processing() || !slot.phase_member) {
+                    return;
+                }
+
+                if (slot.state == SLOT_STATE_WAIT_OTHER) {
+                    SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
+                    return;
+                }
+
+                if (slot.state != SLOT_STATE_PROCESSING_PROMPT && slot.state != SLOT_STATE_STARTED) {
                     return;
                 }
 
@@ -3073,18 +3282,36 @@ private:
                     return;
                 }
 
-                // check if this is a child slot
-                if (slot.state == SLOT_STATE_WAIT_OTHER) {
-                    SLT_DBG(slot, "%s", "waiting for parent slot to complete\n");
-                    return;
+                if (!slot_batched && (!slot_batch_group || !slot_batch_group->is_processing() ||
+                        !slot_batch_group->can_batch_with(slot))) {
+                    slot_batch_group = &slot;
+                    n_prompt_slots_remaining = 0;
+                    for (size_t i = slot_index; i < slots.size(); i++) {
+                        auto & candidate = slots[i];
+                        if (!candidate.phase_member ||
+                                (candidate.state != SLOT_STATE_PROCESSING_PROMPT && candidate.state != SLOT_STATE_STARTED)) {
+                            continue;
+                        }
+                        if (slot.can_batch_with(candidate)) {
+                            n_prompt_slots_remaining++;
+                        }
+                    }
                 }
 
                 // this slot still has a prompt to be processed
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                const auto n_tokens_prev = batch.size();
+                {
                     const auto & input_tokens = slot.task->tokens;
 
-                    // used to determine the number of tokens added to the batch for the current slot
-                    const auto n_tokens_prev = batch.size();
+                    int32_t slot_batch_limit = n_batch;
+                    if (slot.can_split() && slot.task->need_sampling()) {
+                        GGML_ASSERT(n_prompt_slots_remaining > 0);
+                        const int32_t n_batch_remaining = n_batch - batch.size();
+                        const int32_t n_slot_share = std::max<int32_t>(1,
+                                (n_batch_remaining + n_prompt_slots_remaining - 1) / n_prompt_slots_remaining);
+                        slot_batch_limit = batch.size() + n_slot_share;
+                        n_prompt_slots_remaining--;
+                    }
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
@@ -3439,7 +3666,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < slot_batch_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3553,7 +3780,7 @@ private:
                     }
                 }
 
-                if (!slot_batched) {
+                if (!slot_batched && batch.size() > n_tokens_prev) {
                     slot_batched = &slot;
                 }
             });
@@ -3722,7 +3949,8 @@ private:
 
         iterate(slots, [&](server_slot & slot) {
             // optionally send prompt processing progress
-            if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+            if (slot.state == SLOT_STATE_PROCESSING_PROMPT ||
+                    (slot.state == SLOT_STATE_DONE_PROMPT && !slot.prompt_complete)) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
                 }
@@ -3734,6 +3962,11 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                slot.prompt_complete = true;
+                if (scheduler_phase == SERVER_SCHEDULER_PHASE_PREFILL && slot.phase_member) {
+                    scheduler_phase_sealed = true;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch.view);
@@ -3751,12 +3984,11 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
-                // prompt evaluated for next-token prediction
-                slot.state = SLOT_STATE_GENERATING;
-
-                if (slot.can_speculate()) {
-                    common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
-                }
+                const auto * logits = llama_get_logits_ith(slot.ctx_tgt, slot.i_batch - off);
+                GGML_ASSERT(logits != nullptr);
+                slot.prompt_logits.assign(logits, logits + llama_vocab_n_tokens(vocab));
+                slot.i_batch = -1;
+                return;
             } else if (slot.state != SLOT_STATE_GENERATING) {
                 return;
             }

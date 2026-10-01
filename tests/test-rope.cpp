@@ -257,6 +257,46 @@ int main(int /*argc*/, const char ** /*argv*/) {
         }
     }
 
+    {
+        const int n_dims = 64;
+        const int64_t ne[4] = { 2*n_dims, 1, 8, 1 };
+        const int n_ctx_orig = 32768;
+        const float freq_base = 10000.0f;
+        const float freq_scale = 1.0f;
+        const float ext_factor = 0.0f;
+        const float attn_factor = 1.0f;
+        const float beta_fast = 32.0f;
+        const float beta_slow = 1.0f;
+        int sections[4] = { n_dims/2, 0, 0, 0 };
+
+        struct ggml_tensor * x = get_random_tensor_f32(ctx0, 4, ne, -1.0f, 1.0f);
+        struct ggml_tensor * pos_neox = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2]);
+        struct ggml_tensor * pos_mrope = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ne[2] * 4);
+        for (int i = 0; i < ne[2]; ++i) {
+            const int32_t p = 100 + i;
+            ((int32_t *) pos_neox->data)[i] = p;
+            for (int j = 0; j < 4; ++j) {
+                ((int32_t *) pos_mrope->data)[i + ne[2] * j] = p;
+            }
+        }
+
+        struct ggml_tensor * neox = ggml_rope_ext(ctx0, x, pos_neox, nullptr, n_dims, GGML_ROPE_TYPE_NEOX,
+                n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        struct ggml_tensor * temporal_mrope = ggml_rope_multi(ctx0, x, pos_mrope, nullptr, n_dims, sections,
+                GGML_ROPE_TYPE_MROPE, n_ctx_orig, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
+        ggml_cgraph * gf = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf, neox);
+        ggml_build_forward_expand(gf, temporal_mrope);
+        ggml_graph_compute_helper(work_buffer, gf, 4);
+
+        const float * neox_data = (const float *) neox->data;
+        const float * mrope_data = (const float *) temporal_mrope->data;
+        for (int64_t i = 0; i < ggml_nelements(neox); ++i) {
+            GGML_ASSERT(fabsf(neox_data[i] - mrope_data[i]) < 1e-6f);
+        }
+        printf("temporal-only M-RoPE matches NEOX for text positions\n");
+    }
+
     ggml_free(ctx0);
 
     return 0;

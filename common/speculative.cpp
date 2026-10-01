@@ -2552,6 +2552,15 @@ common_speculative_init_result::common_speculative_init_result(
 
         pimpl->model.reset(model_dft);
 
+        const int32_t mrope_compat = llama_model_set_dflash_mrope_from_target(model_dft, model_tgt);
+        if (mrope_compat < 0) {
+            LOG_ERR("%s: invalid DFlash rotary dimensions; refusing speculative draft-context initialization\n", __func__);
+            return;
+        }
+        if (mrope_compat > 0) {
+            LOG_WRN("%s: using temporal-only M-RoPE for legacy DFlash draft paired with a multimodal RoPE target\n", __func__);
+        }
+
         llama_context * ctx_dft = llama_init_from_model(model_dft, cparams);
         if (ctx_dft == nullptr) {
             LOG_ERR("%s: failed to create MTP context\n", __func__);

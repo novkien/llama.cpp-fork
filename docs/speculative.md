@@ -74,6 +74,14 @@ llama-server -m Qwen3-4B.gguf -md Qwen3-4B-DFlash.gguf \
 
 `--spec-draft-n-max` is clamped to the draft model's trained block size.
 
+In this fork, a legacy DFlash GGUF without rotary dimension sections inherits a
+temporal-only M-RoPE layout in memory when paired with a target that has M-RoPE or
+interleaved M-RoPE sections. This allows the draft's text positions to follow gaps
+introduced by image embeddings. Initialization logs when it applies the layout;
+invalid rotary dimensions refuse draft-context initialization. Explicit draft
+sections, text-only targets and DSV4 drafts retain their existing behavior. The
+original GGUF metadata and tensors are unchanged.
+
 See:
 
 - #22105
