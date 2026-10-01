@@ -584,7 +584,7 @@ def test_completion_prefill_barrier_queues_late_arrival_until_generation_finishe
             break
     else:
         first_response.close()
-        pytest.fail("first request did not emit a generation token")
+        raise AssertionError("first request did not emit a generation token")
 
     late_prompt = "Late request waits for the active generation phase. " * 36
     with ThreadPoolExecutor(max_workers=1) as executor:

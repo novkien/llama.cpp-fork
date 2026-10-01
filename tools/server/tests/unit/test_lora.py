@@ -107,7 +107,7 @@ def test_lora_prefill_barrier_advances_past_finished_incompatible_slot():
             break
     else:
         long_response.close()
-        pytest.fail("long LoRA request did not enter prefill")
+        raise AssertionError("long LoRA request did not enter prefill")
 
     short_request = {
         "prompt": "Look in thy glass",
