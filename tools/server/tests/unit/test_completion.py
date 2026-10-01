@@ -4,6 +4,9 @@ import time
 import random
 import os
 import socket
+import json
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue, Empty
 from pathlib import Path
 
 from openai import OpenAI
@@ -373,6 +376,279 @@ def test_completion_parallel_slots(n_slots: int, n_requests: int):
         assert len(res.body["content"]) > 10
         # FIXME: the result is not deterministic when using other slot than slot 0
         # assert match_regex(re_content, res.body["content"])
+
+
+def use_ephemeral_loopback_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        server.server_port = probe.getsockname()[1]
+
+
+def iter_sse_data(response):
+    for line in response.iter_lines():
+        if line.startswith(b"data: "):
+            payload = line[6:]
+            if payload != b"[DONE]":
+                event = json.loads(payload)
+                if event is not None:
+                    yield event
+
+
+def test_completion_prefill_barrier_waits_for_all_prompts():
+    global server
+    server.n_slots = 2
+    server.n_ctx = 4096
+    server.n_batch = 32
+    server.temperature = 0.0
+    use_ephemeral_loopback_port()
+    server.start()
+
+    response = requests.post(server.make_url("/completion"), json={
+        "prompt": ["Short prompt.", "Long prompt for the second slot. " * 48],
+        "n_predict": 2,
+        "stream": True,
+        "return_progress": True,
+    }, stream=True, timeout=30)
+    assert response.status_code == 200
+
+    completed_prompts = set()
+    saw_first_token = False
+    for event in iter_sse_data(response):
+        index = event.get("index")
+        progress = event.get("prompt_progress")
+        if progress and progress["processed"] >= progress["total"]:
+            completed_prompts.add(index)
+        elif not progress and event.get("stop") is False and event.get("tokens"):
+            if not saw_first_token:
+                assert completed_prompts == {0, 1}
+                saw_first_token = True
+
+    response.close()
+    assert saw_first_token
+
+
+def test_completion_prefill_cohort_admits_arrival_during_early_prefill():
+    global server
+    server.n_slots = 2
+    server.n_ctx = 2048
+    server.n_batch = 4
+    server.server_slots = True
+    server.temperature = 0.0
+    use_ephemeral_loopback_port()
+    server.start()
+
+    events = Queue()
+    first_response = requests.post(server.make_url("/completion"), json={
+        "prompt": "Long first prompt. " * 60,
+        "n_predict": 1,
+        "stream": True,
+        "return_progress": True,
+        "id_slot": 0,
+    }, stream=True, timeout=30)
+    assert first_response.status_code == 200
+
+    def drain(label, response):
+        try:
+            for event in iter_sse_data(response):
+                events.put((label, time.monotonic(), event))
+        finally:
+            response.close()
+            events.put((label, time.monotonic(), None))
+
+    def post_and_drain_second():
+        response = requests.post(server.make_url("/completion"), json={
+            "prompt": "Short prompt joins the open cohort.",
+            "n_predict": 1,
+            "stream": True,
+            "return_progress": True,
+            "id_slot": 1,
+        }, stream=True, timeout=30)
+        assert response.status_code == 200
+        drain("second", response)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_done = executor.submit(drain, "first", first_response)
+
+        first_is_prefilling = False
+        first_prompt_total = 0
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not first_is_prefilling:
+            try:
+                label, _, event = events.get(timeout=0.1)
+            except Empty:
+                continue
+            if event is None:
+                break
+            progress = event.get("prompt_progress")
+            if label == "first" and progress and 0 < progress["processed"] < progress["total"]:
+                first_is_prefilling = True
+                first_prompt_total = progress["total"]
+
+        assert first_is_prefilling
+        second_done = executor.submit(post_and_drain_second)
+
+        second_prompt_complete_time = None
+        first_token_time = None
+        completed_streams = set()
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline and len(completed_streams) < 2:
+            try:
+                label, event_time, event = events.get(timeout=0.1)
+            except Empty:
+                continue
+            if event is None:
+                completed_streams.add(label)
+                continue
+
+            progress = event.get("prompt_progress")
+            if label == "second" and progress and progress["processed"] >= progress["total"]:
+                second_prompt_complete_time = event_time
+                slots = requests.get(server.make_url("/slots"), timeout=5).json()
+                first_slot = next(slot for slot in slots if slot["id"] == 0)
+                assert first_slot["is_processing"]
+                assert first_slot["n_prompt_tokens_processed"] < first_prompt_total
+            elif label == "first" and not progress and event.get("stop") is False and event.get("tokens"):
+                if first_token_time is None:
+                    first_token_time = event_time
+
+        first_done.result(timeout=5)
+        second_done.result(timeout=5)
+        assert second_prompt_complete_time is not None
+        assert first_token_time is not None
+        assert second_prompt_complete_time < first_token_time
+
+
+def test_completion_prefill_barrier_parent_children_generate_together():
+    global server
+    server.n_slots = 3
+    server.n_ctx = 1024
+    server.n_batch = 32
+    server.temperature = 0.0
+    use_ephemeral_loopback_port()
+    server.start()
+
+    response = requests.post(server.make_url("/completion"), json={
+        "prompt": "The parent prompt is shared with its completion children.",
+        "n_cmpl": 3,
+        "n_predict": 2,
+        "stream": True,
+        "return_progress": True,
+    }, stream=True, timeout=30)
+    assert response.status_code == 200
+
+    completed_prompts = set()
+    generated_indices = set()
+    finished_indices = set()
+    saw_first_token = False
+    for event in iter_sse_data(response):
+        index = event.get("index")
+        progress = event.get("prompt_progress")
+        if progress and progress["processed"] >= progress["total"]:
+            completed_prompts.add(index)
+        elif not progress and event.get("stop") is False and event.get("tokens"):
+            if not saw_first_token:
+                assert completed_prompts == {0, 1, 2}
+                saw_first_token = True
+            generated_indices.add(index)
+        elif event.get("stop") is True:
+            finished_indices.add(index)
+
+    response.close()
+    assert saw_first_token
+    assert generated_indices == {0, 1, 2}
+    assert finished_indices == {0, 1, 2}
+
+
+def test_completion_prefill_barrier_queues_late_arrival_until_generation_finishes():
+    global server
+    server.n_slots = 2
+    server.n_ctx = 4096
+    server.n_batch = 32
+    server.server_slots = True
+    server.temperature = 0.0
+    use_ephemeral_loopback_port()
+    server.start()
+
+    first_response = requests.post(server.make_url("/completion"), json={
+        "prompt": "First request holds the generation phase.",
+        "n_predict": 1024,
+        "ignore_eos": True,
+        "stream": True,
+        "id_slot": 0,
+    }, stream=True, timeout=30)
+    assert first_response.status_code == 200
+
+    first_events = iter_sse_data(first_response)
+    for event in first_events:
+        if event.get("stop") is False and event.get("tokens") and not event.get("prompt_progress"):
+            break
+    else:
+        first_response.close()
+        pytest.fail("first request did not emit a generation token")
+
+    late_prompt = "Late request waits for the active generation phase. " * 36
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        late_future = executor.submit(server.make_request, "POST", "/completion", {
+            "prompt": late_prompt,
+            "n_predict": 1,
+            "id_slot": 1,
+        })
+
+        observed_wait = False
+        deadline = time.time() + 10
+        while time.time() < deadline and not late_future.done():
+            slots = requests.get(server.make_url("/slots"), timeout=5).json()
+            busy_slots = [slot for slot in slots if slot["is_processing"]]
+            late_slot = next((slot for slot in busy_slots if slot["id"] == 1), None)
+            first_slot = next((slot for slot in busy_slots if slot["id"] == 0), None)
+            if late_slot and first_slot:
+                n_decoded = first_slot.get("next_token", [{}])[0].get("n_decoded", 0)
+                if 0 < n_decoded < 1024:
+                    assert late_slot["n_prompt_tokens_processed"] == 0
+                    observed_wait = True
+                    break
+            time.sleep(0.01)
+
+        assert observed_wait
+
+        for _ in first_events:
+            pass
+        first_response.close()
+        late_result = late_future.result(timeout=30)
+        assert late_result.status_code == 200
+
+
+def test_completion_prefill_barrier_cancellation_releases_waiting_child():
+    global server
+    server.n_slots = 2
+    server.n_ctx = 2048
+    server.n_batch = 32
+    server.server_slots = True
+    use_ephemeral_loopback_port()
+    server.start()
+
+    response = requests.post(server.make_url("/completion"), json={
+        "prompt": "A long prompt keeps its child waiting. " * 32,
+        "n_cmpl": 2,
+        "n_predict": 16,
+        "stream": True,
+        "return_progress": True,
+    }, stream=True, timeout=30)
+    assert response.status_code == 200
+
+    for event in iter_sse_data(response):
+        if event.get("prompt_progress"):
+            break
+    response.close()
+
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        slots = requests.get(server.make_url("/slots"), timeout=5).json()
+        if all(not slot["is_processing"] for slot in slots):
+            break
+        time.sleep(0.05)
+
+    assert all(not slot["is_processing"] for slot in slots)
 
 
 @pytest.mark.parametrize(

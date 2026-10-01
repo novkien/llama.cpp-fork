@@ -1,4 +1,8 @@
+import json
 import pytest
+import requests
+import socket
+from concurrent.futures import ThreadPoolExecutor
 from utils import *
 
 server = ServerPreset.stories15m_moe()
@@ -64,6 +68,71 @@ def test_lora_per_request():
     assert all([res.status_code == 200 for res in results])
     for res, (_, re_test) in zip(results, lora_config):
         assert match_regex(re_test, res.body["content"])
+
+
+def test_lora_prefill_barrier_advances_past_finished_incompatible_slot():
+    global server
+    server.n_slots = 2
+    server.n_ctx = 2048
+    server.n_batch = 8
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        server.server_port = probe.getsockname()[1]
+    server.start()
+
+    long_response = requests.post(server.make_url("/completion"), json={
+        "prompt": "Look in thy glass and tell the story. " * 24,
+        "n_predict": 4,
+        "stream": True,
+        "return_progress": True,
+        "cache_prompt": False,
+        "id_slot": 1,
+        "lora": [{"id": 0, "scale": 1.0}],
+    }, stream=True, timeout=(5, 20))
+    assert long_response.status_code == 200
+
+    def iter_sse_data(response):
+        for line in response.iter_lines():
+            if line.startswith(b"data: "):
+                payload = line[6:]
+                if payload != b"[DONE]":
+                    event = json.loads(payload)
+                    if event is not None:
+                        yield event
+
+    long_events = iter(iter_sse_data(long_response))
+    for event in long_events:
+        progress = event.get("prompt_progress")
+        if progress and 0 < progress["processed"] < progress["total"]:
+            break
+    else:
+        long_response.close()
+        pytest.fail("long LoRA request did not enter prefill")
+
+    short_request = {
+        "prompt": "Look in thy glass",
+        "n_predict": 2,
+        "cache_prompt": False,
+        "id_slot": 0,
+        "lora": [{"id": 0, "scale": 0.0}],
+    }
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        short_future = executor.submit(
+            requests.post,
+            server.make_url("/completion"),
+            json=short_request,
+            timeout=30,
+        )
+
+        long_finished = False
+        for event in long_events:
+            if event.get("stop") is True:
+                long_finished = True
+
+        short_response = short_future.result(timeout=30)
+        assert short_response.status_code == 200
+        assert long_finished
+        long_response.close()
 
 
 @pytest.mark.skipif(not is_slow_test_allowed(), reason="skipping slow test")
