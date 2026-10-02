@@ -43,12 +43,12 @@ static void native_roundtrip(const char * model_path) {
     auto * ctx = init->context();
     check(ctx != nullptr, "initialize native test context");
     const auto decode = [&](const server_prompt & p, int id_slot) {
-        llama_batch batch = llama_batch_init(p.n_tokens(), 0, 1);
+        common_batch batch(ctx);
+        const std::vector<llama_seq_id> seq_ids = { id_slot };
         for (int i = 0; i < p.n_tokens(); ++i) {
-            common_batch_add(batch, p.tokens[i], i, { id_slot }, i + 1 == p.n_tokens());
+            batch.add(p.tokens[i], i, seq_ids, i + 1 == p.n_tokens());
         }
-        const int result = llama_decode(ctx, batch);
-        llama_batch_free(batch);
+        const int result = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         check(result == 0, "decode native test prompt");
     };
     server_prompt_cache cache(64, 0);
