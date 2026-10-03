@@ -51,7 +51,7 @@
 #   define N_THREADS std::thread::hardware_concurrency()
 #endif
 
-static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
+static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f, uint32_t seed = 0) {
     if (ggml_is_empty(tensor)) {
         return;
     }
@@ -63,10 +63,18 @@ static void init_tensor_uniform(ggml_tensor * tensor, float min = -1.0f, float m
         static const size_t n_threads = std::max<size_t>(1, std::min<size_t>(nels/1024, std::min<size_t>(4, N_THREADS/2)));
 
         auto init_thread = [&](size_t start, size_t end) {
-            thread_local std::default_random_engine gen(std::random_device{}());
             std::uniform_real_distribution<float> distribution(min, max);
-            for (size_t i = start; i < end; i++) {
-                data[i] = distribution(gen);
+            auto fill = [&](auto & gen) {
+                for (size_t i = start; i < end; i++) {
+                    data[i] = distribution(gen);
+                }
+            };
+            if (seed == 0) {
+                thread_local std::default_random_engine gen(std::random_device{}());
+                fill(gen);
+            } else {
+                std::default_random_engine gen(static_cast<std::default_random_engine::result_type>(seed + start));
+                fill(gen);
             }
         };
 
@@ -193,9 +201,44 @@ static void init_tensor_kq_mask(ggml_tensor * tensor, float min = -1.0f, float m
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
-static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
+static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max, int sparse_mask_pattern = 0) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F16);
     GGML_ASSERT(n_kv_max > 0 && n_kv_max <= tensor->ne[0]);
+
+    if (sparse_mask_pattern != 0) {
+        GGML_ASSERT(sparse_mask_pattern == 1 || sparse_mask_pattern == 2);
+
+        const int64_t ne0   = tensor->ne[0];
+        const int64_t nrows = ggml_nrows(tensor);
+        GGML_ASSERT(nrows <= ne0);
+
+        // Avoid a second full-size FP32 buffer for long QSA prefill masks.
+        std::vector<ggml_fp16_t> data_f16(ggml_nelements(tensor), ggml_fp32_to_fp16(-INFINITY));
+        for (int64_t row = 0; row < nrows; ++row) {
+            int64_t start;
+            int64_t end;
+            if (sparse_mask_pattern == 1) {
+                // Each 16-query tile owns disjoint hint-sized intervals, reaching the exact
+                // ncols1*n_kv_max allocation bound. Repeat the same tile pattern for longer
+                // prefill batches so every tile retains that worst-case union.
+                start = (row % 16)*n_kv_max;
+                end   = start + n_kv_max;
+                GGML_ASSERT(end <= ne0);
+            } else {
+                // Causal sliding window ending at this query's absolute KV position.
+                const int64_t q_pos = ne0 - nrows + row;
+                end   = q_pos + 1;
+                start = std::max<int64_t>(0, end - n_kv_max);
+            }
+
+            for (int64_t i = start; i < end; ++i) {
+                data_f16[row*ne0 + i] = ggml_fp32_to_fp16(-0.03125f*(1 + (i + row) % 7));
+            }
+        }
+
+        ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
+        return;
+    }
 
     const int64_t ne0 = tensor->ne[0];
     const int64_t nrows = ggml_nrows(tensor);
@@ -7965,9 +8008,11 @@ struct test_flash_attn_ext : public test_case {
     const bool kv_view; // create K/V as views of a larger buffer (like a KV cache)
     const bool v_is_view_of_k;
     const int64_t n_kv_max;
+    const int sparse_mask_pattern; // 0: existing random sparse mask, 1: disjoint hint-bound rows, 2: causal sliding window
 
     std::string vars() override {
-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max) +
+            ",sparse_mask_pattern=" + std::to_string(sparse_mask_pattern);
     }
 
     double max_nmse_err() override {
@@ -7984,9 +8029,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
+                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0, int sparse_mask_pattern = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max), sparse_mask_pattern(sparse_mask_pattern) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
@@ -8054,18 +8099,29 @@ struct test_flash_attn_ext : public test_case {
     }
 
     void initialize_tensors(ggml_context * ctx) override {
+        const auto tensor_seed = [&](const ggml_tensor * tensor) {
+            if (sparse_mask_pattern == 0) {
+                return uint32_t(0);
+            }
+            if (strcmp(tensor->name, "q") == 0) return 0x51534101u;
+            if (strcmp(tensor->name, "k") == 0) return 0x51534102u;
+            if (strcmp(tensor->name, "v") == 0) return 0x51534103u;
+            if (strcmp(tensor->name, "s") == 0) return 0x51534104u;
+            return uint32_t(0);
+        };
+
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
-                init_tensor_uniform(t, -10.0f, 10.0f);
+                init_tensor_uniform(t, -10.0f, 10.0f, tensor_seed(t));
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
-                    init_tensor_kq_mask_sparse(t, n_kv_max);
+                    init_tensor_kq_mask_sparse(t, n_kv_max, sparse_mask_pattern);
                 } else {
                     init_tensor_kq_mask(t);
                 }
             } else {
-                init_tensor_uniform(t);
+                init_tensor_uniform(t, -1.0f, 1.0f, tensor_seed(t));
             }
         }
     }
@@ -11170,6 +11226,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 8, false, false, 0, 0,
         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false));
 
+    // QSA V100 sparse-MMA probe: 16 queries share a 4-head GQA tile and an exact 16*2051 disjoint mask union.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  65792, 17, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 2051, 1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  65792, 17, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 2051, 1));
+
+    // Guard controls: below the sparse K/V threshold, a non-16-query tile, and non-Q8 K/V stay on existing paths.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  65536, 17, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 2051, 1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  65664,  8, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 2051, 1));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  65664, 17, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 2051, 1));
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
@@ -11670,6 +11740,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 10000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {16, 1}, 20000, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Qwen QSA sparse-MMA probe: compare a repeated 16-query union-bound mask against the
+    // higher-overlap causal window at the same GQA12/Q8_0 shapes and actual 2051-token bound.
+    for (int sparse_mask_pattern : {1, 2}) {
+        for (int64_t kv : {131072, 200704}) {
+            for (int64_t nb : {512, 1024}) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                    GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 2051,
+                    sparse_mask_pattern));
+            }
+        }
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 4096, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

@@ -1802,7 +1802,8 @@ static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_u
     return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
            (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16) ||
            (DKQ == 256 && DV == 256 && ncols1 == 1 && ncols2 == 8) ||
-           (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8);
+           (DKQ == 256 && DV == 256 && ncols1 == 8 && ncols2 == 8) ||
+           (DKQ == 256 && DV == 256 && ncols1 == 16 && ncols2 == 4);
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap, bool V_is_K_view, bool use_sparse>

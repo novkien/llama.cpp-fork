@@ -115,10 +115,11 @@ void ggml_cuda_flash_attn_ext_compact_mask(
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     // the last group of queries is partial only if ncols1 does not divide n_queries
-    GGML_ASSERT(ncols1 == 1 || ncols1 == 8);
-    const auto kernel = ncols1 == 1       ? flash_attn_mask_to_sparse_indices<1, false> :
-                        n_queries % 8 != 0 ? flash_attn_mask_to_sparse_indices<8, true>  :
-                                             flash_attn_mask_to_sparse_indices<8, false>;
+    GGML_ASSERT(ncols1 == 1 || ncols1 == 8 || ncols1 == 16);
+    const auto kernel = ncols1 == 1        ? flash_attn_mask_to_sparse_indices<1, false>  :
+                        ncols1 == 8        ? (n_queries % 8  != 0 ? flash_attn_mask_to_sparse_indices<8, true>  : flash_attn_mask_to_sparse_indices<8, false>) :
+                        n_queries % 16 != 0 ? flash_attn_mask_to_sparse_indices<16, true> :
+                                              flash_attn_mask_to_sparse_indices<16, false>;
     ggml_cuda_kernel_launch(kernel, launch_params,
         (const half *) mask->data, indices, counts, int(mask->ne[0]), n_queries, n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
@@ -132,7 +133,9 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #else
     const ggml_tensor * Q    = dst->src[0];
     const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
 
     float max_bias = 0.0f;
     float logit_softcap = 0.0f;
@@ -144,7 +147,20 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
     // the dense kernel handles up to 64/ncols2 queries per K/V pass, the single-query gather has to beat that
     const int64_t n_gather = (ncols1 == 1 ? std::min<int64_t>(Q->ne[1], 64/ncols2) : ncols1) * (int64_t) n_kv_max;
 
-    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) &&
+    const bool new_16x4_shape = ncols1 == 16 && ncols2 == 4 &&
+        Q->ne[0] == 256 && K->ne[0] == 256 && V->ne[0] == 256;
+    // At 1024 queries, the dense path already limits KV scanning from the mask.
+    const bool qwen_qsa_sm70 = cc == GGML_CUDA_CC_VOLTA && new_16x4_shape &&
+        Q->type == GGML_TYPE_F32 && Q->ne[1] > 8 && Q->ne[1] < 1024 && Q->ne[2] == 24 && Q->ne[3] == 1 &&
+        K->type == GGML_TYPE_Q8_0 && K->ne[2] == 2 && K->ne[3] == 1 &&
+        V->type == GGML_TYPE_Q8_0 && V->ne[1] == K->ne[1] && V->ne[2] == 2 && V->ne[3] == 1 &&
+        mask != nullptr && mask->type == GGML_TYPE_F16 && mask->ne[1] == Q->ne[1] &&
+        mask->ne[2] == 1 && mask->ne[3] == 1 && sinks == nullptr && n_kv_max == 2051;
+    // The new 16x4 D256 sparse instantiation is intentionally limited to the QSA V100 case.
+    // Keep the previously unsupported 16x4 shape dense on Turing and newer devices.
+    const bool arch_supported = qwen_qsa_sm70 || (turing_mma_available(cc) && !new_16x4_shape);
+
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && arch_supported &&
         mask != nullptr && n_kv_max > 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
