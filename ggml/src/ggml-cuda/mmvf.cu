@@ -451,6 +451,14 @@ void launch_mul_mat_vec_f_cuda(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (cc == GGML_CUDA_CC_VOLTA && std::is_same_v<T, nv_bfloat16> &&
+            ncols == 320 && nrows == 10240 && ncols_dst == 4 && ids == nullptr &&
+            !is_multi_token_id && !has_fusion) {
+        // Keep each output row in one warp for this small-K projection.
+        block_size_best = 32;
+    }
+
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(block_size_best, 1, 1);
