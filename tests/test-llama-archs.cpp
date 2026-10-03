@@ -114,7 +114,8 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
 }
 
 static gguf_context_ptr get_gguf_ctx(
-        const llm_arch arch, const bool moe, const bool qwen4exp_mtp = false, const bool qwen4exp_mtp_qsa = false) {
+        const llm_arch arch, const bool moe, const bool qwen4exp_mtp = false, const bool qwen4exp_mtp_qsa = false,
+        const uint32_t qwen4exp_indexer_n_head = 64) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -345,8 +346,9 @@ static gguf_context_ptr get_gguf_ctx(
         ms.add_kv(LLM_KV_PLE_HEAD_VOCAB_SIZES,        ple_head_vocab_sizes);
     }
 
-    // minimax-m3 keeps one indexer head per GQA head; the rest use a fixed 64 to match the fused
-    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head : uint32_t(64));
+    // minimax-m3 keeps one indexer head per GQA head; the default fixture count is 64.
+    ms.add_kv(LLM_KV_ATTENTION_INDEXER_HEAD_COUNT,   arch == LLM_ARCH_MINIMAX_M3 ? n_head :
+              arch == LLM_ARCH_QWEN4EXP ? qwen4exp_indexer_n_head : uint32_t(64));
     // qwen4exp ropes indexer keys with the main rotary width, so its head can't be < n_rot
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_KEY_LENGTH,
               arch == LLM_ARCH_QWEN4EXP ? n_embd_head : uint32_t(128));
@@ -489,7 +491,8 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool load_mtp = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool load_mtp = false,
+        uint32_t n_seq_max = 1) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
@@ -503,6 +506,7 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
     ctx_params.n_ctx = 0;
     ctx_params.n_threads = 4;
     ctx_params.n_threads_batch = 4;
+    ctx_params.n_seq_max = n_seq_max;
     if (!encode) {
         ctx_params.n_ubatch = 64;
     }
@@ -522,14 +526,17 @@ static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
 }
 
 static std::vector<float> get_logits(
-        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false) {
+        llama_model * model, llama_context * lctx, const std::vector<llama_token> & tokens, bool encode = false,
+        uint32_t n_seqs = 1) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ctx    = llama_n_ctx(lctx);
     const uint32_t n_tokens = tokens.size();
+    GGML_ASSERT(n_seqs > 0 && n_tokens % n_seqs == 0);
+    const uint32_t n_tokens_per_seq = n_tokens / n_seqs;
     common_batch batch(lctx);
     GGML_ASSERT(n_tokens <= n_ctx);
     for (uint32_t pos = 0; pos < n_tokens; pos++) {
-        batch.add(tokens[pos], pos, 0, true);
+        batch.add(tokens[pos], pos % n_tokens_per_seq, pos / n_tokens_per_seq, true);
     }
     if (encode) {
         if (llama_process(lctx, LLAMA_PROCESS_TYPE_ENCODE, batch.get())) {
@@ -551,13 +558,17 @@ static std::vector<float> get_logits(
     return ret;
 }
 
-static bool test_qwen4exp_mtp_graph(const size_t seed, const float stdev, const bool mtp_qsa) {
-    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true, mtp_qsa);
+static bool test_qwen4exp_mtp_graph(
+        const size_t seed, const float stdev, const bool mtp_qsa,
+        uint32_t indexer_n_head = 64, uint32_t n_seqs = 1, uint32_t n_verify_tokens = 2) {
+    GGML_ASSERT(n_seqs > 0 && n_verify_tokens > 0 && n_verify_tokens % n_seqs == 0);
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true, mtp_qsa, indexer_n_head);
     auto model_and_ctx = get_model_and_ctx(
-            gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, true);
-    const std::vector<llama_token> tokens = get_tokens(2, llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx.first.get())), seed);
+            gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, true, n_seqs);
+    const std::vector<llama_token> tokens = get_tokens(n_verify_tokens,
+            llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx.first.get())), seed);
 
-    if (get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens).empty()) {
+    if (get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens, false, n_seqs).empty()) {
         return false;
     }
 
@@ -567,6 +578,7 @@ static bool test_qwen4exp_mtp_graph(const size_t seed, const float stdev, const 
     params.n_threads_batch = 4;
     params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
     params.ctx_other = model_and_ctx.second.get();
+    params.n_seq_max = n_seqs;
 
     llama_context_ptr mtp_ctx(llama_init_from_model(model_and_ctx.first.get(), params));
     if (!mtp_ctx) {
@@ -579,9 +591,10 @@ static bool test_qwen4exp_mtp_graph(const size_t seed, const float stdev, const 
     }
 
     std::vector<float> state(llama_model_n_embd_out(model_and_ctx.first.get()), 0.0f);
-    const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens.back());
+    const uint32_t n_tokens_per_seq = n_verify_tokens / n_seqs;
+    const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens[n_tokens_per_seq - 1]);
     const llama_embd hidden = { state.data(), 1, state.size() };
-    const llama_pos pos = static_cast<llama_pos>(tokens.size());
+    const llama_pos pos = static_cast<llama_pos>(n_tokens_per_seq);
     const bool batch_ok = idx >= 0 &&
         llama_batch_ext_set_embd_token(batch, idx, hidden) &&
         llama_batch_ext_set_pos(batch, idx, &pos) &&
@@ -809,7 +822,11 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
         if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH) {
             continue;
         }
-        for (bool moe : {false, true}) {
+        std::vector<std::pair<bool, uint32_t>> model_configs{{false, 64}, {true, 64}};
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            model_configs.emplace_back(true, 4);
+        }
+        for (const auto & [moe, qwen4exp_indexer_n_head] : model_configs) {
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
@@ -820,9 +837,12 @@ static int save_models(const std::string & arch_filter, const size_t seed, const
                 LOG_INF("%s: %s model (%s) is unsupported, skipping\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense");
                 continue;
             }
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, false, false, qwen4exp_indexer_n_head);
             auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, {});
-            const std::string path = dir + "/" + llm_arch_name(arch) + (moe ? "-moe.gguf" : "-dense.gguf");
+            const std::string suffix = (moe ? "-moe" : "-dense") +
+                    (arch == LLM_ARCH_QWEN4EXP && qwen4exp_indexer_n_head != 64
+                            ? "-h" + std::to_string(qwen4exp_indexer_n_head) : "") + ".gguf";
+            const std::string path = dir + "/" + llm_arch_name(arch) + suffix;
             LOG_INF("%s: Saving %s model (%s) to %s...\n", __func__, llm_arch_name(arch), moe ? "MoE" : "dense", path.c_str());
             llama_model_save_to_file(model_and_ctx.first.get(), path.c_str());
         }
@@ -896,8 +916,8 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         max_arch_name_length = std::max(max_arch_name_length, strlen(llm_arch_name(arch)));
     }
 
-    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|%15s|%9s|\n";
-    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%6s|";
+    const std::string template_header  = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%9s|%15s|%9s|\n";
+    const std::string template_row_cfg = std::string("|%" + std::to_string(max_arch_name_length) + "s|%") + std::to_string(max_device_label_length) + "s|%9s|";
     const std::string template_row_res = "%15s %10s|%20s|\n";
 
     bool all_ok = true;
@@ -929,15 +949,21 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (bool moe : {false, true}) {
+        std::vector<std::pair<bool, uint32_t>> arch_configs{{false, 64}, {true, 64}};
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            arch_configs.emplace_back(true, 4);
+        }
+        for (const auto & [moe, qwen4exp_indexer_n_head] : arch_configs) {
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
             if (!moe && moe_mandatory(arch)) {
                 continue;
             }
-            const std::string config_name = moe ? "MoE" : "Dense";
-            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe);
+            const std::string config_name = arch == LLM_ARCH_QWEN4EXP
+                    ? std::string(moe ? "MoE H" : "Dense H") + std::to_string(qwen4exp_indexer_n_head)
+                    : (moe ? "MoE" : "Dense");
+            gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, false, false, qwen4exp_indexer_n_head);
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
             }
@@ -1036,6 +1062,19 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                 n_failed++;
                 all_ok = false;
             }
+        }
+
+        LOG_INF("qwen4exp MTP graph (QSA H4, 2x4 verify): ");
+        fflush(stdout);
+
+        const bool test_ok = test_qwen4exp_mtp_graph(seed, stdev, true, 4, 2, 8);
+        n_tests++;
+        if (test_ok) {
+            LOG_INF("OK\n");
+        } else {
+            LOG_ERR("FAIL\n");
+            n_failed++;
+            all_ok = false;
         }
     }
 
