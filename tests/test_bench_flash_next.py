@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -9,16 +10,22 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.bench_flash_next import (  # noqa: E402
+    FAMILIES,
+    PAD_ATOMS,
     SSEParser,
     _compare_environment,
     _completion_body,
     _campaign_outcome,
     _feed_raw_chunk,
+    _fixture_content,
     _load_evidence_manifest,
+    _messages,
     _native_props_evidence,
     _proxy_release_evidence,
     _request_evidence,
     _write_raw_sse,
+    PromptPreparer,
+    fit_prompt,
     summarize_stream,
 )
 
@@ -75,6 +82,26 @@ def _valid_stream(*, prompt_ms=10.0, predicted_ms=100.0, content_predicted_n=3):
     return chunks
 
 
+class FakePromptPreparer(PromptPreparer):
+    def __init__(self):
+        super().__init__("", 0, None, None)
+
+    def count(self, messages: list[dict[str, str]]) -> int:
+        return len(re.findall(r"\w+|[^\w\s]", messages[0]["content"]))
+
+
+def _padding_atom_count(padding):
+    counts = {0: 0}
+    for offset in range(len(padding)):
+        if offset not in counts:
+            continue
+        for atom in PAD_ATOMS:
+            end = offset + len(atom)
+            if padding.startswith(atom, offset):
+                counts[end] = max(counts.get(end, 0), counts[offset] + 1)
+    return counts.get(len(padding), 0)
+
+
 def _summarize(chunks, *, prompt_ms=10.0, ended_ns=None, incomplete=False):
     parser = SSEParser()
     events = []
@@ -128,6 +155,32 @@ def _complete_evidence_manifest():
 
 
 class FlashBenchStreamTests(unittest.TestCase):
+    def test_fit_prompt_preserves_padding_across_iterations(self):
+        seed = 731
+        preparer = FakePromptPreparer()
+        questions = {
+            "prose": "Question: summarize the pattern, cite uncertain measurements, and recommend the next inspection.",
+            "code": "Question: explain the parsing behavior, identify an edge case, and suggest a focused test.",
+            "structured": "Question: summarize the records, separate verified facts from uncertainty, and recommend a check.",
+        }
+        for family in FAMILIES:
+            for lane in (0, 1):
+                base = _fixture_content(family, 0, seed, lane)
+                target = preparer.count(_messages(base)) + 3
+                messages, prepared_tokens = fit_prompt(
+                    preparer, family, target, seed=seed, lane=lane,
+                )
+                content = messages[0]["content"]
+                question = questions[family]
+                prefix = base[:-len(question)]
+                padding = content[len(prefix):-len(question)]
+
+                self.assertEqual(prepared_tokens, target)
+                self.assertEqual(preparer.count(messages), target)
+                self.assertTrue(content.startswith(prefix))
+                self.assertTrue(content.endswith(question))
+                self.assertGreaterEqual(_padding_atom_count(padding), 2)
+
     def test_fragmented_sse_handles_crlf_utf8_and_multiple_delta_tokens(self):
         event = 'data: {"choices":[{"delta":{"reasoning_content":"café"}}]}\r\n\r\n'.encode()
         parser = SSEParser()
