@@ -10259,6 +10259,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // Qwen4Exp hc_gate uses BF16 weights with K=320 and M=10240.
+    for (int n : { 1, 3, 4, 5 }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 10240, n, 320, { 1, 1 }, { 1, 1 }));
+    }
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 4, 320, { 1, 1 }, { 1, 1 }, { 0, 1, 2, 3 }, 384));
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 4, 320, { 2, 1 }, { 2, 1 }));
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -11652,6 +11661,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, m, bs, 4096, {1, 1}, {1, 1}));
         }
     }
+
+    // Qwen4Exp hc_gate MMVF shape: K=320, M=10240, W4.
+    test_cases.emplace_back(new test_mul_mat(
+        GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 4, 320, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
