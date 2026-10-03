@@ -113,7 +113,8 @@ static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32
     return ret;
 }
 
-static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
+static gguf_context_ptr get_gguf_ctx(
+        const llm_arch arch, const bool moe, const bool qwen4exp_mtp = false, const bool qwen4exp_mtp_qsa = false) {
     gguf_context_ptr ret(gguf_init_empty());
     llama_model_saver ms(arch, ret.get());
     const uint32_t n_ctx = 256;
@@ -123,7 +124,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     uint32_t n_head  = 2;
     uint32_t n_ff    = 384;
     uint32_t n_layer = 2;
-    if (arch == LLM_ARCH_LLAMA4) {
+    if (arch == LLM_ARCH_QWEN4EXP && qwen4exp_mtp) {
+        n_layer = 4; // three trunk layers and one MTP layer
+    } else if (arch == LLM_ARCH_LLAMA4) {
         n_layer = 4; // hparams.n_no_rope_layer_step is hard-coded to 4
     } else if (arch == LLM_ARCH_GEMMA4) {
         n_embd = 128;
@@ -184,6 +187,9 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FEATURES_LENGTH,           n_embd);
     ms.add_kv(LLM_KV_BLOCK_COUNT,               n_layer);
     ms.add_kv(LLM_KV_LEADING_DENSE_BLOCK_COUNT, uint32_t(1));
+    if (arch == LLM_ARCH_QWEN4EXP && qwen4exp_mtp) {
+        ms.add_kv(LLM_KV_NEXTN_PREDICT_LAYERS, uint32_t(1));
+    }
 
     if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         std::vector<uint32_t> n_ff_per_layer;
@@ -302,8 +308,17 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, uint32_t(2));
         ms.add_kv(LLM_KV_HYPER_CONNECTION_EPSILON,  1.0e-6f);
         ms.add_kv(LLM_KV_HYPER_CONNECTION_LOW_RANK, uint32_t(8));
-        // without this the QSA layers fall back to dense and go uncovered
-        ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        if (arch == LLM_ARCH_QWEN4EXP) {
+            std::vector<uint32_t> ratios(n_layer, 0);
+            ratios[1] = 4; // QSA trunk layer
+            if (qwen4exp_mtp_qsa) {
+                ratios[n_layer - 1] = 4;
+            }
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, ratios);
+        } else {
+            // without this the QSA layers fall back to dense and go uncovered
+            ms.add_kv(LLM_KV_ATTENTION_COMPRESS_RATIOS, std::vector<uint32_t>(n_layer, 4));
+        }
 
         // has_cell_ext() needs ple_n_heads here: the indexer cache serializes no ext without it
         const uint32_t ple_ngram_size      = 3;
@@ -474,10 +489,11 @@ static bool silent_model_load_progress(float /*progress*/, void * /*user_data*/)
 static std::pair<llama_model_ptr, llama_context_ptr> get_model_and_ctx(
         struct gguf_context * gguf_ctx, FILE * file, const size_t seed, const float stdev,
         const std::vector<ggml_backend_dev_t> & devs,
-        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false) {
+        const llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER, bool encode = false, bool load_mtp = false) {
     GGML_ASSERT((gguf_ctx == nullptr) != (file == nullptr));
     llama_model_params model_params = llama_model_default_params();
     model_params.progress_callback = silent_model_load_progress;
+    model_params.load_mtp = load_mtp;
     std::vector<ggml_backend_dev_t> devs_copy = devs;
     devs_copy.push_back(nullptr);
     model_params.devices = devs_copy.data();
@@ -533,6 +549,56 @@ static std::vector<float> get_logits(
         }
     }
     return ret;
+}
+
+static bool test_qwen4exp_mtp_graph(const size_t seed, const float stdev, const bool mtp_qsa) {
+    gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_QWEN4EXP, true, true, mtp_qsa);
+    auto model_and_ctx = get_model_and_ctx(
+            gguf_ctx.get(), nullptr, seed, stdev, {}, LLAMA_SPLIT_MODE_LAYER, false, true);
+    const std::vector<llama_token> tokens = get_tokens(2, llama_vocab_n_tokens(llama_model_get_vocab(model_and_ctx.first.get())), seed);
+
+    if (get_logits(model_and_ctx.first.get(), model_and_ctx.second.get(), tokens).empty()) {
+        return false;
+    }
+
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = 0;
+    params.n_threads = 4;
+    params.n_threads_batch = 4;
+    params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    params.ctx_other = model_and_ctx.second.get();
+
+    llama_context_ptr mtp_ctx(llama_init_from_model(model_and_ctx.first.get(), params));
+    if (!mtp_ctx) {
+        return false;
+    }
+
+    llama_batch_ext * batch = llama_batch_ext_init(mtp_ctx.get());
+    if (batch == nullptr) {
+        return false;
+    }
+
+    std::vector<float> state(llama_model_n_embd_out(model_and_ctx.first.get()), 0.0f);
+    const int32_t idx = llama_batch_ext_add_token(batch, 0, tokens.back());
+    const llama_embd hidden = { state.data(), 1, state.size() };
+    const llama_pos pos = static_cast<llama_pos>(tokens.size());
+    const bool batch_ok = idx >= 0 &&
+        llama_batch_ext_set_embd_token(batch, idx, hidden) &&
+        llama_batch_ext_set_pos(batch, idx, &pos) &&
+        llama_batch_ext_set_output_logits(batch, idx, true);
+    if (!batch_ok) {
+        llama_batch_ext_free(batch);
+        return false;
+    }
+
+    const int32_t status = llama_process(mtp_ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch);
+    llama_batch_ext_free(batch);
+    if (status != 0) {
+        LOG_ERR("%s: MTP decode failed (mtp_qsa=%d, status=%d)\n", __func__, mtp_qsa, status);
+        return false;
+    }
+
+    return true;
 }
 
 static bool check_causal_attn_toggle(
@@ -952,6 +1018,23 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
 
                 // log the results for this test case
                 LOG(template_row_res.c_str(), status_nmse.c_str(), nmse_str, status_roundtrip.c_str());
+            }
+        }
+    }
+
+    if (arch_supported(LLM_ARCH_QWEN4EXP) && arch_matches(arch_filter, LLM_ARCH_QWEN4EXP)) {
+        for (const bool mtp_qsa : { false, true }) {
+            LOG_INF("qwen4exp MTP graph (%s): ", mtp_qsa ? "QSA" : "dense");
+            fflush(stdout);
+
+            const bool test_ok = test_qwen4exp_mtp_graph(seed, stdev, mtp_qsa);
+            n_tests++;
+            if (test_ok) {
+                LOG_INF("OK\n");
+            } else {
+                LOG_ERR("FAIL\n");
+                n_failed++;
+                all_ok = false;
             }
         }
     }
