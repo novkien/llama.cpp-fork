@@ -13,6 +13,7 @@ import math
 import os
 import re
 import random
+import sys
 import threading
 import time
 import urllib.error
@@ -1472,9 +1473,9 @@ def main(argv: list[str] | None = None) -> int:
     (output_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(
+    sys.stdout.write(
         f"Wrote {len(all_records)} requests ({len(invalid_samples)} invalid measured samples, "
-        f"acceptance_eligible={outcome['acceptance_eligible']}, status={outcome['status']}) to {output_dir}"
+        f"acceptance_eligible={outcome['acceptance_eligible']}, status={outcome['status']}) to {output_dir}\n"
     )
     return outcome["exit_code"]
 

@@ -5,9 +5,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# Direct execution puts tests/ on sys.path, so add the checkout root before importing scripts.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.bench_flash_next import (
+from scripts.bench_flash_next import (  # noqa: E402
     SSEParser,
     _compare_environment,
     _completion_body,
