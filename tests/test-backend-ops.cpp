@@ -11154,6 +11154,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Qwen QSA: 256/256, gqa 12, budget 2048.
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
 
+    // Volta FA needs at least 32 columns. Cover small query batches around the 16-column boundary.
+    for (int64_t kv : {65664, 65792}) {
+        for (int64_t nb : {5, 8, 16, 17}) {
+            const ggml_type type_KV = nb == 5 || nb == 17 ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+            const bool kv_view = nb >= 16;
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, kv, nb, true, false, 0, 0,
+                GGML_PREC_F32, type_KV, type_KV, {0, 2, 1, 3}, kv_view, false, 2051));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65664, 8, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 65792, 8, true, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, true, false, 2051));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 8, false, false, 0, 0,
+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false));
+
     // more V-is-sub-view-of-K cases: other head shapes, and full views with equal head sizes
     test_cases.emplace_back(new test_flash_attn_ext(320, 256, 1, {32, 1}, 512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
     test_cases.emplace_back(new test_flash_attn_ext(192, 128, 4, {8, 1},  512, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true));
