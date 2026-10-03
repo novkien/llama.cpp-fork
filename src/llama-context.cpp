@@ -1,5 +1,6 @@
 #include "llama-context.h"
 
+#include "ggml-backend-impl.h"
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -675,10 +676,23 @@ void llama_context::sched_reserve() {
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
             if (cparams.pipeline_parallel) {
-                LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
-                cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
-                gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
+                if (n_copies > 2) {
+                    LLAMA_LOG_WARN("%s: compute buffer allocation failed with %d pipeline copies, retrying with 2 copies\n",
+                            __func__, n_copies);
+                    sched.reset(ggml_backend_sched_new_with_n_copies(
+                            backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, 2, cparams.op_offload));
+                    gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                }
+
+                if (!gf && ggml_backend_sched_get_n_copies(sched.get()) > 1) {
+                    const int n_copies_failed = ggml_backend_sched_get_n_copies(sched.get());
+                    LLAMA_LOG_WARN("%s: compute buffer allocation failed with %d pipeline copies, retrying without pipeline parallelism\n",
+                            __func__, n_copies_failed);
+                    cparams.pipeline_parallel = false;
+                    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                    gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
+                }
             }
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");

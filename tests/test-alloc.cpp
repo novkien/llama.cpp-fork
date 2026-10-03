@@ -15,6 +15,7 @@ uint8_t * const alloc_base = (uint8_t *) 16;
 
 struct dummy_backend_context {
     size_t max_buffer_size = 64;
+    size_t max_total_size  = SIZE_MAX;
     size_t alignment       = 8;
 
     ggml_backend_buffer_i              buffer_interface;
@@ -24,6 +25,8 @@ struct dummy_backend_context {
 
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
+    size_t events_created = 0;
+    size_t events_freed   = 0;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -42,6 +45,10 @@ static const char * dummy_backend_buffer_type_get_name(ggml_backend_buffer_type_
 
 static ggml_backend_buffer_t dummy_backend_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     dummy_backend_context * ctx    = (dummy_backend_context *) buft->context;
+    const size_t allocated = ctx->allocated_total();
+    if (allocated > ctx->max_total_size || size > ctx->max_total_size - allocated) {
+        return nullptr;
+    }
     ggml_backend_buffer_t & buffer = ctx->buffers.emplace_back();
     buffer                         = ggml_backend_buffer_init(buft, ctx->buffer_interface, ctx, size);
     return buffer;
@@ -126,6 +133,20 @@ static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_b
     return device->context == buft->context;
 }
 
+static ggml_backend_event_t dummy_backend_device_event_new(ggml_backend_dev_t dev) {
+    dummy_backend_context * ctx = (dummy_backend_context *) dev->context;
+    ctx->events_created++;
+    return new ggml_backend_event{ dev, ctx };
+}
+
+static void dummy_backend_device_event_free(ggml_backend_dev_t /*dev*/, ggml_backend_event_t event) {
+    dummy_backend_context * ctx = (dummy_backend_context *) event->context;
+    ctx->events_freed++;
+    delete event;
+}
+
+static void dummy_backend_device_event_synchronize(ggml_backend_dev_t /*dev*/, ggml_backend_event_t /*event*/) {}
+
 // ggml_backend interface
 
 static const char * dummy_backend_get_name(ggml_backend_t /*backend*/) {
@@ -139,11 +160,12 @@ struct dummy_backend {
     ggml_backend_buffer_type               buffer_type;
 };
 
-static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8) {
+static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment = 8, size_t max_total_size = SIZE_MAX) {
     dummy_backend b{};
     b.context                  = std::make_unique<dummy_backend_context>();
     b.context->alignment       = alignment;
     b.context->max_buffer_size = max_buffer_size;
+    b.context->max_total_size  = max_total_size;
 
     b.context->buffer_interface.free_buffer   = dummy_backend_buffer_free_buffer;
     b.context->buffer_interface.get_base      = dummy_backend_buffer_get_base;
@@ -157,6 +179,9 @@ static dummy_backend dummy_backend_init(size_t max_buffer_size, size_t alignment
     b.context->device.iface.get_type      = dummy_backend_device_get_type;
     b.context->device.iface.supports_op   = dummy_backend_device_supports_op;
     b.context->device.iface.supports_buft = dummy_backend_device_supports_buft;
+    b.context->device.iface.event_new     = dummy_backend_device_event_new;
+    b.context->device.iface.event_free    = dummy_backend_device_event_free;
+    b.context->device.iface.event_synchronize = dummy_backend_device_event_synchronize;
 
     b.context->backend.context        = b.context.get();
     b.context->backend.device         = &b.context->device;
@@ -677,6 +702,86 @@ static void test_graph_optimize_alloc_dep() {
     GGML_ASSERT(!graph_reuses_allocation(true));
 }
 
+struct sched_alloc_result {
+    bool   allocated;
+    size_t buffer_size;
+    size_t events_created;
+    size_t events_freed;
+};
+
+static sched_alloc_result sched_alloc_with_n_copies(int n_copies, size_t max_total_size = SIZE_MAX) {
+    dummy_backend backend      = dummy_backend_init(SIZE_MAX, 8, max_total_size);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * input  = make_input_with_size(ctx, 64);
+    ggml_tensor * output = ggml_scale(ctx, input, 2.0f);
+    ggml_set_output(output);
+    ggml_build_forward_expand(graph, output);
+
+    ggml_backend_t             backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft        = &backend.buffer_type;
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new_with_n_copies(
+            &backend_ptr, &buft, 1, 8, n_copies, true));
+    GGML_ASSERT(ggml_backend_sched_get_n_copies(sched.get()) == n_copies);
+
+    const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), graph);
+    const size_t buffer_size = backend.context->allocated_total();
+    const size_t events_created = backend.context->events_created;
+
+    sched.reset();
+
+    GGML_ASSERT(backend.context->buffers.empty());
+    GGML_ASSERT(backend.context->events_created == backend.context->events_freed);
+
+    return { allocated, buffer_size, events_created, backend.context->events_freed };
+}
+
+static int sched_default_n_copies(bool parallel) {
+    dummy_backend backend = dummy_backend_init(SIZE_MAX);
+    ggml_backend_t backend_ptr = &backend.context->backend;
+    ggml_backend_buffer_type_t buft = &backend.buffer_type;
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(&backend_ptr, &buft, 1, 8, parallel, true));
+    const int n_copies = ggml_backend_sched_get_n_copies(sched.get());
+    sched.reset();
+    GGML_ASSERT(backend.context->events_created == backend.context->events_freed);
+    return n_copies;
+}
+
+static void test_sched_copy_count_alloc_and_cleanup() {
+    const int n_copies_parallel = sched_default_n_copies(true);
+    GGML_ASSERT(sched_default_n_copies(false) == 1);
+
+    const sched_alloc_result one = sched_alloc_with_n_copies(1);
+    GGML_ASSERT(one.allocated);
+    GGML_ASSERT(one.events_created == 0);
+    GGML_ASSERT(one.events_freed == 0);
+
+    if (n_copies_parallel >= 2) {
+        const sched_alloc_result two = sched_alloc_with_n_copies(2);
+        GGML_ASSERT(two.allocated);
+        GGML_ASSERT(two.buffer_size > one.buffer_size);
+        GGML_ASSERT(two.events_created == 2);
+        GGML_ASSERT(two.events_freed == 2);
+    }
+
+    if (n_copies_parallel > 2) {
+        const sched_alloc_result parallel = sched_alloc_with_n_copies(n_copies_parallel);
+        GGML_ASSERT(parallel.allocated);
+        GGML_ASSERT(parallel.buffer_size > one.buffer_size);
+
+        const size_t limit = one.buffer_size + (parallel.buffer_size - one.buffer_size + 1) / 2;
+        const sched_alloc_result parallel_limited = sched_alloc_with_n_copies(n_copies_parallel, limit);
+        GGML_ASSERT(!parallel_limited.allocated);
+        GGML_ASSERT(parallel_limited.events_created == (size_t) n_copies_parallel);
+        GGML_ASSERT(parallel_limited.events_freed == (size_t) n_copies_parallel);
+
+        const sched_alloc_result two_limited = sched_alloc_with_n_copies(2, limit);
+        GGML_ASSERT(two_limited.allocated);
+        GGML_ASSERT(two_limited.events_created == 2);
+        GGML_ASSERT(two_limited.events_freed == 2);
+    }
+}
+
 // Check that the size reported by ggml_backend_alloc_ctx_tensors_from_buft_size
 // matches the actual size of the buffer allocated for the ctx tensors
 static ggml_backend_buffer_ptr check_size_matches(ggml_backend_buffer_type_t buft, ggml_context * ctx) {
@@ -1121,6 +1226,7 @@ int main() {
     run("test_buffer_size_zero", test_buffer_size_zero);
     run("test_reallocation", test_reallocation);
     run("test_graph_optimize_alloc_dep", test_graph_optimize_alloc_dep);
+    run("test_sched_copy_count_alloc_and_cleanup", test_sched_copy_count_alloc_and_cleanup);
     run("test_buft_alloc_buffer_n_single_buffer", test_buft_alloc_buffer_n_single_buffer);
     run("test_buft_alloc_buffer_n_multi_buffer", test_buft_alloc_buffer_n_multi_buffer);
     run("test_buft_alloc_buffer_n_zero_size", test_buft_alloc_buffer_n_zero_size);
