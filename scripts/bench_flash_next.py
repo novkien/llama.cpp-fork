@@ -926,8 +926,8 @@ def fit_prompt(
         return _messages(content), current
 
     for _ in range(128):
-        best_content = None
         best_count = current
+        best_padding = None
         for atom in PAD_ATOMS:
             candidate_padding = padding + atom
             candidate = _fixture_content(family, low, seed, lane, candidate_padding)
@@ -935,11 +935,12 @@ def fit_prompt(
             if measured == target:
                 return _messages(candidate), measured
             if current < measured <= target and measured > best_count:
-                best_content, best_count = candidate, measured
-        if best_content is None:
+                best_count = measured
+                best_padding = candidate_padding
+        if best_padding is None:
             break
-        content, current = best_content, best_count
-        padding = content[len(_fixture_content(family, low, seed, lane)):]
+        current = best_count
+        padding = best_padding
     raise ValueError(f"fixture could not reach exactly {target} tokens (nearest lower count {current})")
 
 
