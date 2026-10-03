@@ -812,17 +812,30 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
-    // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim)
-    // one product for all heads, then the heads are summed as slices, so nothing is transposed
-    ggml_tensor * kq = ggml_mul_mat(ctx0,
-            ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
-            ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
-    kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
-
     ggml_tensor * score = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
-        score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
+    // Keep enough PP workspace for the original small-query graph.
+    const bool split_qsa_heads = n_idx_h == 4 && n_tokens > 8 &&
+            std::min(cparams.n_ctx, cparams.n_ubatch) >= 32;
+    if (split_qsa_heads) {
+        // Keep the large pool-by-token score temporary to one head at a time.
+        ggml_tensor * pooled_2d = ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool);
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * q_head = ggml_view_2d(ctx0, q, idx_dim, n_tokens, q->nb[2], h*q->nb[1]);
+            ggml_tensor * kq_head = ggml_mul_mat(ctx0, pooled_2d, q_head);
+            kq_head = ggml_relu(ctx0, kq_head);
+            score = score ? ggml_add(ctx0, score, kq_head) : kq_head;
+        }
+    } else {
+        // The reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim).
+        ggml_tensor * kq = ggml_mul_mat(ctx0,
+                ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
+                ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
+        kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
+
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
+            score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
+        }
     }
     score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
     score = ggml_add(ctx0, score, inp_kpool->pool_mask); // [n_pool, n_tokens]
