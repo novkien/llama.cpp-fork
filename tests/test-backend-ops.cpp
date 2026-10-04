@@ -10268,6 +10268,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 4, 320, { 2, 1 }, { 2, 1 }));
 
+    // Flash/MTP Q6_K W4 shapes, including the measured small-M fallback cases.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  512, 4,  2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  640, 4,  2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 4,  2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 4, 2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 4, 2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, 4, 6144, { 1, 1 }, { 1, 1 }));
+
+    // Small-M draft shape plus row and width fallback controls.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  320, 4, 10240, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6145, 4,  2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 3,  2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 5,  2560, { 1, 1 }, { 1, 1 }));
+
+    // Actual Qwen-27B Q6_K W4 tensor shapes.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 4,  5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5120, 4, 17408, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5120, 4,  6144, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 4,  5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  6144, 4,  5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  1024, 4,  5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 4,  5120, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5120, 4, 10240, { 1, 1 }, { 1, 1 }));
+
+    // Q6_K W4 layout controls: padded K view and batch broadcast.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,
+        6144, 4, 2560, { 1, 1 }, { 1, 1 }, { 0, 1, 2, 3 }, 2816));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,
+        6144, 4, 2560, { 2, 1 }, { 2, 1 }));
+
+    // Candidate Flash Next MTP Q6_K vocabulary head plus row/width/K fallback controls.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 2, 2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 4, 2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248319, 1, 2560, { 1, 1 }, { 1, 1 }));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 2816, { 1, 1 }, { 1, 1 }));
+
     // The SYCL backend picks between one and two output rows per subgroup by row count when there
     // are two destination columns (Q4_K_MMVQ_ROW_PAIR_MIN_NROWS in ggml-sycl/mmvq.cpp). Cover both
     // sides of that boundary, including an odd row count above it for the row-pair tail.
@@ -11665,6 +11702,43 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // Qwen4Exp hc_gate MMVF shape: K=320, M=10240, W4.
     test_cases.emplace_back(new test_mul_mat(
         GGML_TYPE_BF16, GGML_TYPE_F32, 10240, 4, 320, {1, 1}, {1, 1}));
+
+    // Flash/MTP Q6_K W4 shapes, including the measured small-M fallback cases.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  512, 4,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  640, 4,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 4,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 4, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 4, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 2560, 4, 6144, {1, 1}, {1, 1}));
+
+    // Small-M draft shape plus row and width fallback controls.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  320, 4, 10240, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6145, 4,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 3,  2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 6144, 5,  2560, {1, 1}, {1, 1}));
+
+    // Actual Qwen-27B Q6_K W4 tensor shapes.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 17408, 4,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5120, 4, 17408, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5120, 4,  6144, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 10240, 4,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  6144, 4,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  1024, 4,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 12288, 4,  5120, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5120, 4, 10240, {1, 1}, {1, 1}));
+
+    // Q6_K W4 layout controls: padded K view and batch broadcast.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,
+        6144, 4, 2560, {1, 1}, {1, 1}, {0, 1, 2, 3}, 2816));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,
+        6144, 4, 2560, {2, 1}, {2, 1}));
+
+    // Candidate Flash Next MTP Q6_K vocabulary head plus row/width/K fallback controls.
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 2, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 4, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248319, 1, 2560, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, 248320, 1, 2816, {1, 1}, {1, 1}));
 
     // qwen3-30b-a3b
     for (int bs : {1, 4, 8, 32, 64, 128, 256, 512}) {
